@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import uuid  # Added missing import
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,10 +62,14 @@ async def pre_filter(file: UploadFile):
         input_data = json.loads(contents.decode('utf-8'))
         
         # Save input for debugging
-        debug_path = f"/tmp/input_{uuid.uuid4()}.json"
-        with open(debug_path, 'w') as f:
-            json.dump(input_data, f)
-        logger.info(f"Saved input for debugging to {debug_path}")
+        debug_path = None
+        try:
+            debug_path = f"/tmp/input_{uuid.uuid4()}.json"
+            with open(debug_path, 'w') as f:
+                json.dump(input_data, f)
+            logger.info(f"Saved input for debugging to {debug_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save debug input: {e}")
         
         # Validate basic structure
         if not input_data.get('pages') or not input_data.get('metadata'):
@@ -162,11 +167,15 @@ async def pre_filter(file: UploadFile):
         raise e
     except Exception as e:
         logger.error(f"Error during pre-filtering: {e}", exc_info=True)
-        # Save full input for debugging
-        debug_path = f"/tmp/error_input_{uuid.uuid4()}.json"
-        with open(debug_path, 'w') as f:
-            json.dump(input_data, f)
-        logger.info(f"Saved error input to {debug_path}")
+        # Save full input for debugging on error
+        if debug_path is None:
+            try:
+                debug_path = f"/tmp/error_input_{uuid.uuid4()}.json"
+                with open(debug_path, 'w') as f:
+                    json.dump(input_data, f)
+                logger.info(f"Saved error input to {debug_path}")
+            except Exception as save_error:
+                logger.warning(f"Failed to save error input: {save_error}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/health/")
