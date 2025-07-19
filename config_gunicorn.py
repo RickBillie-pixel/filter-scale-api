@@ -25,7 +25,7 @@ errorlog = "-"
 loglevel = "info"
 
 # Process naming
-proc_name = 'merged-extraction-api'
+proc_name = 'pre-filter-scale-api'
 
 # Server mechanics
 daemon = False
