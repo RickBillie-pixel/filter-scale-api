@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-import uuid  # Added missing import
+import uuid
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,7 +16,7 @@ PORT = int(os.environ.get("PORT", 10000))
 app = FastAPI(
     title="Pre-Filter API",
     description="Pre-filters Vector Drawing API output to include only lines with length >= 50 and texts",
-    version="1.0.2"
+    version="1.0.3"
 )
 
 # CORS middleware
@@ -51,6 +51,18 @@ class FilteredOutput(BaseModel):
     pages: List[FilteredPage]
     summary: Dict[str, Any]
 
+def parse_input_data(contents: str) -> Dict:
+    """Parse the input JSON string, handling potential nested JSON."""
+    try:
+        data = json.loads(contents)
+        if isinstance(data, str):
+            logger.warning("Input is a string, attempting to parse again")
+            data = json.loads(data)
+        return data
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON input: {str(e)}")
+
 @app.post("/pre-filter/")
 async def pre_filter(file: UploadFile):
     """Pre-filter the Vector Drawing JSON file to include only lines with length >= 50 and texts"""
@@ -58,8 +70,8 @@ async def pre_filter(file: UploadFile):
         logger.info(f"Received file: {file.filename}")
         
         # Read and parse the uploaded JSON file
-        contents = await file.read()
-        input_data = json.loads(contents.decode('utf-8'))
+        contents = (await file.read()).decode('utf-8')  # Ensure string input
+        input_data = parse_input_data(contents)
         
         # Save input for debugging
         debug_path = None
@@ -73,9 +85,11 @@ async def pre_filter(file: UploadFile):
         
         # Validate basic structure
         if not input_data.get('pages') or not input_data.get('metadata'):
-            raise HTTPException(status_code=400, detail=f"Invalid Vector Drawing JSON structure: {json.dumps({'metadata': input_data.get('metadata'), 'pages': input_data.get('pages')[:1] if input_data.get('pages') else None})}")
+            logger.error(f"Invalid structure: pages={input_data.get('pages')}, metadata={input_data.get('metadata')}")
+            raise HTTPException(status_code=400, detail="Invalid Vector Drawing JSON structure: missing pages or metadata")
         
         if not isinstance(input_data.get('pages'), list):
+            logger.error(f"Pages is not a list: {type(input_data.get('pages'))}")
             raise HTTPException(status_code=400, detail="Pages must be a list")
         
         # Filter data
@@ -91,7 +105,7 @@ async def pre_filter(file: UploadFile):
             lines = drawings.get('lines', [])
             if not isinstance(lines, list):
                 logger.warning(f"Unexpected drawings format for page {page.get('page_number')}: {drawings}")
-                continue
+                lines = []  # Default to empty list if not a list
             
             # Filter vectors to only lines with length >= 50
             for vec in lines:
@@ -115,7 +129,7 @@ async def pre_filter(file: UploadFile):
             texts = page.get('texts', [])
             if not isinstance(texts, list):
                 logger.warning(f"Unexpected texts format for page {page.get('page_number')}: {texts}")
-                continue
+                texts = []  # Default to empty list if not a list
             
             for txt in texts:
                 if 'text' in txt and 'position' in txt:
@@ -180,7 +194,7 @@ async def pre_filter(file: UploadFile):
 
 @app.get("/health/")
 async def health():
-    return {"status": "healthy", "version": "1.0.2"}
+    return {"status": "healthy", "version": "1.0.3"}
 
 if __name__ == "__main__":
     import uvicorn
