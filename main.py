@@ -15,8 +15,8 @@ PORT = int(os.environ.get("PORT", 10000))
 
 app = FastAPI(
     title="Pre-Filter API",
-    description="Pre-filters Vector Drawing API output to include only lines with length >= 65 and texts",
-    version="1.0.4"
+    description="Pre-filters Vector Drawing API output to include only lines with length >= 100 and texts",
+    version="1.0.5"
 )
 
 # CORS middleware
@@ -69,7 +69,7 @@ def parse_input_data(contents: str) -> Dict:
 
 @app.post("/pre-filter/")
 async def pre_filter(file: UploadFile):
-    """Pre-filter the Vector Drawing JSON file to include only lines with length >= 65 and texts"""
+    """Pre-filter the Vector Drawing JSON file to include only lines with length >= 100 and texts"""
     try:
         logger.info(f"Received file: {file.filename}")
         
@@ -128,13 +128,13 @@ async def pre_filter(file: UploadFile):
                 logger.warning(f"Lines is not a list for page {page.get('page_number')}: {type(lines)}")
                 lines = []
             
-            # Filter lines with length >= 65
+            # Filter lines with length >= 100
             for line in lines:
                 try:
                     # Check if it's a line and has required fields
                     if (line.get('type') == 'line' and 
                         'p1' in line and 'p2' in line and 
-                        line.get('length', 0) >= 65):
+                        line.get('length', 0) >= 100):
                         
                         filtered_vec = {
                             'type': line['type'],
@@ -219,7 +219,7 @@ async def pre_filter(file: UploadFile):
             'summary': filtered_summary
         }
         
-        logger.info(f"Filtering complete: {filtered_lines} lines kept out of {total_lines} (min length: 65), {total_texts} texts")
+        logger.info(f"Filtering complete: {filtered_lines} lines kept out of {total_lines} (min length: 100), {total_texts} texts")
         
         return filtered_output
     
@@ -231,7 +231,7 @@ async def pre_filter(file: UploadFile):
 
 @app.get("/health/")
 async def health():
-    return {"status": "healthy", "version": "1.0.4", "min_line_length": 65}
+    return {"status": "healthy", "version": "1.0.5", "min_line_length": 100}
 
 if __name__ == "__main__":
     import uvicorn
