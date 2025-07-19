@@ -14,8 +14,8 @@ PORT = int(os.environ.get("PORT", 10000))
 
 app = FastAPI(
     title="Pre-Filter API",
-    description="Pre-filters Vector Drawing API output to include only lines and texts, removing non-essential attributes",
-    version="1.0.0"
+    description="Pre-filters Vector Drawing API output to include only lines with length >= 50 and texts",
+    version="1.0.1"
 )
 
 # CORS middleware
@@ -52,7 +52,7 @@ class FilteredOutput(BaseModel):
 
 @app.post("/pre-filter/")
 async def pre_filter(file: UploadFile):
-    """Pre-filter the Vector Drawing JSON file to include only lines and texts"""
+    """Pre-filter the Vector Drawing JSON file to include only lines with length >= 50 and texts"""
     try:
         logger.info(f"Received file: {file.filename}")
         
@@ -62,7 +62,10 @@ async def pre_filter(file: UploadFile):
         
         # Validate basic structure
         if not input_data.get('pages') or not input_data.get('metadata'):
-            raise HTTPException(status_code=400, detail="Invalid Vector Drawing JSON structure")
+            raise HTTPException(status_code=400, detail="Invalid Vector Drawing JSON structure: missing pages or metadata")
+        
+        if not isinstance(input_data.get('pages'), list):
+            raise HTTPException(status_code=400, detail="Pages must be a list")
         
         # Filter data
         filtered_pages = []
@@ -72,9 +75,16 @@ async def pre_filter(file: UploadFile):
         for page in input_data['pages']:
             filtered_drawings = {'lines': []}
             
-            # Filter vectors to only lines
-            for vec in page.get('drawings', {}).get('lines', []):
-                if vec.get('type') == 'line':
+            # Access drawings safely
+            drawings = page.get('drawings', {})
+            lines = drawings.get('lines', [])
+            if not isinstance(lines, list):
+                logger.warning(f"Unexpected drawings format for page {page.get('page_number')}, skipping")
+                continue
+            
+            # Filter vectors to only lines with length >= 50
+            for vec in lines:
+                if vec.get('type') == 'line' and vec.get('length', 0) >= 50:
                     filtered_vec = FilteredVector(
                         type=vec['type'],
                         p1=vec['p1'],
@@ -85,16 +95,22 @@ async def pre_filter(file: UploadFile):
                     filtered_drawings['lines'].append(filtered_vec.dict())
                     total_lines += 1
             
-            # Keep texts, removing non-essential attributes like source, dimension_info
+            # Keep texts, removing non-essential attributes
             filtered_texts = []
-            for txt in page.get('texts', []):
-                filtered_txt = FilteredText(
-                    text=txt['text'],
-                    position=txt['position'],
-                    bbox=txt.get('bbox')
-                )
-                filtered_texts.append(filtered_txt.dict())
-                total_texts += 1
+            texts = page.get('texts', [])
+            if not isinstance(texts, list):
+                logger.warning(f"Unexpected texts format for page {page.get('page_number')}, skipping")
+                continue
+            
+            for txt in texts:
+                if 'text' in txt and 'position' in txt:
+                    filtered_txt = FilteredText(
+                        text=txt['text'],
+                        position=txt['position'],
+                        bbox=txt.get('bbox')
+                    )
+                    filtered_texts.append(filtered_txt.dict())
+                    total_texts += 1
             
             filtered_page = FilteredPage(
                 page_number=page['page_number'],
@@ -112,9 +128,9 @@ async def pre_filter(file: UploadFile):
             'total_rectangles': 0,  # Excluded
             'total_curves': 0,  # Excluded
             'total_polygons': 0,  # Excluded
-            'dimensions_found': input_data['summary']['dimensions_found'],  # Keep original
-            'file_size_mb': input_data['summary']['file_size_mb'],
-            'processing_time_ms': input_data['summary']['processing_time_ms']
+            'dimensions_found': input_data['summary']['dimensions_found'] if 'summary' in input_data and 'dimensions_found' in input_data['summary'] else 0,
+            'file_size_mb': input_data['summary'].get('file_size_mb', 0),
+            'processing_time_ms': input_data['summary'].get('processing_time_ms', 0)
         }
         
         # Build response
@@ -136,7 +152,7 @@ async def pre_filter(file: UploadFile):
 
 @app.get("/health/")
 async def health():
-    return {"status": "healthy", "version": "1.0.0"}
+    return {"status": "healthy", "version": "1.0.1"}
 
 if __name__ == "__main__":
     import uvicorn
