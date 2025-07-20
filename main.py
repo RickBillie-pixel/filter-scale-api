@@ -1,25 +1,22 @@
-import os
-import json
-import logging
-import uuid
-from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import json
+import re
+import math
+from typing import List, Dict, Optional
+import time
+import logging
+from ratelimit import limits, sleep_and_retry
+from functools import lru_cache
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+app = FastAPI(title="Pre-Scale Filter API", description="Detects scales from vector drawing JSON", version="1.0.0")
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-PORT = int(os.environ.get("PORT", 10000))
-
-app = FastAPI(
-    title="Pre-Filter API",
-    description="Pre-filters Vector Drawing API output to include only lines with length >= 100 and texts",
-    version="1.0.5"
-)
-
-# CORS middleware
+# CORS for cross-origin requests
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,211 +25,226 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class FilteredVector(BaseModel):
-    type: str
-    p1: Dict[str, float]
-    p2: Dict[str, float]
-    length: Optional[float] = None
-    orientation: Optional[str] = None
-    width: Optional[float] = None
-    opacity: Optional[float] = None
-
-class FilteredText(BaseModel):
+# Pydantic Models
+class TextItem(BaseModel):
     text: str
-    position: Dict[str, float]
-    bbox: Optional[Dict[str, float]] = None
-    page_number: Optional[int] = None
-    source: Optional[str] = None
+    position: Optional[Dict[str, float]] = None
+    bbox: Dict[str, float]
 
-class FilteredPage(BaseModel):
+class LineItem(BaseModel):
+    type: str
+    points: Optional[List[Dict[str, float]]] = None  # For beziers
+    p1: Optional[Dict[str, float]] = None  # For straight lines
+    p2: Optional[Dict[str, float]] = None
+    length: Optional[float] = None
+
+class PageItem(BaseModel):
     page_number: int
     page_size: Dict[str, float]
-    texts: List[FilteredText]
-    drawings: Dict[str, List]  # Only lines will be included
+    texts: List[TextItem]
+    drawings: Dict[str, List[LineItem]]
 
-class FilteredOutput(BaseModel):
-    metadata: Dict[str, Any]
-    pages: List[FilteredPage]
-    summary: Dict[str, Any]
+class InputData(BaseModel):
+    metadata: Optional[Dict] = None
+    pages: List[PageItem]
 
-def parse_input_data(contents: str) -> Dict:
-    """Parse the input JSON string, handling potential nested JSON."""
-    try:
-        data = json.loads(contents)
-        if isinstance(data, str):
-            logger.warning("Input is a string, attempting to parse again")
-            data = json.loads(data)
-        return data
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse JSON: {e}")
-        raise HTTPException(status_code=400, detail=f"Invalid JSON input: {str(e)}")
+class ScaleMatch(BaseModel):
+    text_value: float
+    line_length_points: float
+    calculated_scale: float
+    distance_to_text_points: float
+    ratio: float
 
-@app.post("/pre-filter/")
-async def pre_filter(file: UploadFile):
-    """Pre-filter the Vector Drawing JSON file to include only lines with length >= 100 and texts"""
-    try:
-        logger.info(f"Received file: {file.filename}")
-        
-        # Read and parse the uploaded JSON file
-        contents = (await file.read()).decode('utf-8')
-        input_data = parse_input_data(contents)
-        
-        # Save input for debugging
-        debug_path = None
-        try:
-            debug_path = f"/tmp/input_{uuid.uuid4()}.json"
-            with open(debug_path, 'w') as f:
-                json.dump(input_data, f, indent=2)
-            logger.info(f"Saved input for debugging to {debug_path}")
-        except Exception as e:
-            logger.warning(f"Failed to save debug input: {e}")
-        
-        # Check if this is the old format from Master API
-        if 'vector_data' in input_data and 'texts' in input_data:
-            logger.error("Received old format from Master API, this should be Vector Drawing API format")
-            raise HTTPException(
-                status_code=400, 
-                detail="Invalid format: Expected Vector Drawing API output with 'metadata', 'pages', and 'summary'"
-            )
-        
-        # Validate Vector Drawing API structure
-        if not input_data.get('pages') or not input_data.get('metadata'):
-            logger.error(f"Invalid structure: pages={type(input_data.get('pages'))}, metadata={type(input_data.get('metadata'))}")
-            raise HTTPException(
-                status_code=400, 
-                detail="Invalid Vector Drawing JSON structure: missing pages or metadata"
-            )
-        
-        if not isinstance(input_data.get('pages'), list):
-            logger.error(f"Pages is not a list: {type(input_data.get('pages'))}")
-            raise HTTPException(status_code=400, detail="Pages must be a list")
-        
-        # Filter data
-        filtered_pages = []
-        total_lines = 0
-        total_texts = 0
-        filtered_lines = 0
-        
-        for page in input_data['pages']:
-            # Initialize filtered drawings with only lines
-            filtered_drawings = {'lines': []}
-            
-            # Safely access drawings
-            drawings = page.get('drawings', {})
-            if not isinstance(drawings, dict):
-                logger.warning(f"Drawings is not a dict for page {page.get('page_number')}: {type(drawings)}")
-                drawings = {}
-            
-            lines = drawings.get('lines', [])
-            if not isinstance(lines, list):
-                logger.warning(f"Lines is not a list for page {page.get('page_number')}: {type(lines)}")
-                lines = []
-            
-            # Filter lines with length >= 100
-            for line in lines:
-                try:
-                    # Check if it's a line and has required fields
-                    if (line.get('type') == 'line' and 
-                        'p1' in line and 'p2' in line and 
-                        line.get('length', 0) >= 100):
-                        
-                        filtered_vec = {
-                            'type': line['type'],
-                            'p1': line['p1'],
-                            'p2': line['p2'],
-                            'length': line.get('length')
-                        }
-                        
-                        # Add optional fields if present
-                        if 'orientation' in line:
-                            filtered_vec['orientation'] = line['orientation']
-                        if 'width' in line:
-                            filtered_vec['width'] = line['width']
-                        if 'opacity' in line:
-                            filtered_vec['opacity'] = line['opacity']
-                        
-                        filtered_drawings['lines'].append(filtered_vec)
-                        filtered_lines += 1
-                    total_lines += 1
-                except Exception as e:
-                    logger.warning(f"Error processing line {line}: {e}")
-                    continue
-            
-            # Process texts
-            filtered_texts = []
-            texts = page.get('texts', [])
-            if not isinstance(texts, list):
-                logger.warning(f"Texts is not a list for page {page.get('page_number')}: {type(texts)}")
-                texts = []
-            
-            for txt in texts:
-                try:
-                    if 'text' in txt and 'position' in txt:
-                        filtered_txt = {
-                            'text': txt['text'],
-                            'position': txt['position']
-                        }
-                        
-                        # Add optional fields if present
-                        if 'bbox' in txt:
-                            filtered_txt['bbox'] = txt['bbox']
-                        if 'page_number' in txt:
-                            filtered_txt['page_number'] = txt['page_number']
-                        if 'source' in txt:
-                            filtered_txt['source'] = txt['source']
-                        
-                        filtered_texts.append(filtered_txt)
-                        total_texts += 1
-                except Exception as e:
-                    logger.warning(f"Error processing text {txt}: {e}")
-                    continue
-            
-            # Build filtered page
-            filtered_page = {
-                'page_number': page.get('page_number', 1),
-                'page_size': page.get('page_size', {'width': 0, 'height': 0}),
-                'texts': filtered_texts,
-                'drawings': filtered_drawings
-            }
-            
-            filtered_pages.append(filtered_page)
-        
-        # Prepare filtered summary
-        original_summary = input_data.get('summary', {})
-        filtered_summary = {
-            'total_pages': len(filtered_pages),
-            'total_texts': total_texts,
-            'total_lines': filtered_lines,  # Only filtered lines
-            'original_lines': total_lines,   # Total lines before filtering
-            'total_rectangles': 0,
-            'total_curves': 0,
-            'total_polygons': 0,
-            'dimensions_found': original_summary.get('dimensions_found', 0),
-            'file_size_mb': original_summary.get('file_size_mb', 0),
-            'processing_time_ms': original_summary.get('processing_time_ms', 0)
-        }
-        
-        # Build response with same structure as input
-        filtered_output = {
-            'metadata': input_data.get('metadata', {}),
-            'pages': filtered_pages,
-            'summary': filtered_summary
-        }
-        
-        logger.info(f"Filtering complete: {filtered_lines} lines kept out of {total_lines} (min length: 100), {total_texts} texts")
-        
-        return filtered_output
+class OrientationScale(BaseModel):
+    points_per_meter: float
+    confidence: float
+    validation_count: int
+    lines_used: List[ScaleMatch]
+
+class OutputData(BaseModel):
+    status: str
+    scales: Dict[str, OrientationScale]
+    dimension_lines: List[Dict]  # Placeholder for future
+    warnings: List[str]
+    processing_stats: Dict
+
+# Regex patterns for dimensions
+DIMENSION_PATTERNS = [
+    r'^\d{2,5}$',  # Pure numbers 10-99999
+    r'^\d+\.\d+$',  # Decimals
+    r'^\d+(?:\s+\d+)*$',  # Multi-numbers
+    r'^\d+\.?\d*\s*(?:mm|cm|m)$',  # With units
+    r'^\d+[xX×]\d+$'  # e.g., 67X114
+]
+
+def extract_numeric_value(text: str) -> Optional[float]:
+    """Extract and convert dimension to mm."""
+    text = text.strip().lower()
+    for pattern in DIMENSION_PATTERNS:
+        if re.match(pattern, text):
+            if 'x' in text or '×' in text:
+                parts = re.split(r'[x×]', text)
+                return float(parts[0])  # Use first part for simplicity, assume width/height
+            if 'mm' in text:
+                return float(re.sub(r'[^\d.]', '', text))
+            elif 'cm' in text:
+                return float(re.sub(r'[^\d.]', '', text)) * 10
+            elif 'm' in text:
+                return float(re.sub(r'[^\d.]', '', text)) * 1000
+            else:
+                return float(text)  # Assume mm if no unit
+    return None
+
+def calculate_length(p1: Dict[str, float], p2: Dict[str, float]) -> float:
+    """Calculate Euclidean length."""
+    return math.sqrt((p2['x'] - p1['x'])**2 + (p2['y'] - p1['y'])**2)
+
+def is_straight_bezier(points: List[Dict[str, float]]) -> bool:
+    """Check if bezier is essentially straight (collinear points within 1%)."""
+    if len(points) != 4:
+        return False
+    p0, p1, p2, p3 = points
+    # Check if control points align
+    dx1 = p1['x'] - p0['x']
+    dy1 = p1['y'] - p0['y']
+    dx2 = p3['x'] - p2['x']
+    dy2 = p3['y'] - p2['y']
+    return abs(dx1 * dy2 - dx2 * dy1) < 0.01 * calculate_length(p0, p3)
+
+def filter_lines(drawings: Dict[str, List[LineItem]]) -> List[Dict]:
+    """Filter top 50 longest straight lines, classify orientation."""
+    all_lines = []
+    for item in drawings.get('lines', []):
+        if item.type == 'line':
+            length = item.length or calculate_length(item.p1, item.p2)
+            if length > 10:
+                p1, p2 = item.p1, item.p2
+                dx = abs(p2['x'] - p1['x'])
+                dy = abs(p2['y'] - p1['y'])
+                orientation = 'horizontal' if dx > dy * 10 else 'vertical' if dy > dx * 10 else 'diagonal'
+                if orientation != 'diagonal':
+                    all_lines.append({'p1': p1, 'p2': p2, 'length': length, 'orientation': orientation})
+        elif item.type == 'bezier' and is_straight_bezier(item.points):
+            p1, p3 = item.points[0], item.points[3]
+            length = calculate_length(p1, p3)
+            if length > 10:
+                dx = abs(p3['x'] - p1['x'])
+                dy = abs(p3['y'] - p1['y'])
+                orientation = 'horizontal' if dx > dy * 10 else 'vertical' if dy > dx * 10 else 'diagonal'
+                if orientation != 'diagonal':
+                    all_lines.append({'p1': p1, 'p2': p3, 'length': length, 'orientation': orientation})
+    all_lines.sort(key=lambda l: l['length'], reverse=True)
+    return all_lines[:50]
+
+def midpoint(line: Dict) -> tuple:
+    """Get midpoint of line."""
+    return ((line['p1']['x'] + line['p2']['x']) / 2, (line['p1']['y'] + line['p2']['y']) / 2)
+
+def distance_to_midpoint(text_pos: tuple, line_mid: tuple) -> float:
+    """Euclidean distance to midpoint."""
+    return math.sqrt((text_pos[0] - line_mid[0])**2 + (text_pos[1] - line_mid[1])**2)
+
+@lru_cache(maxsize=128)
+def match_text_to_lines(text: TextItem, lines: List[Dict], orientation: str, max_distance: float) -> List[Dict]:
+    """Match text to closest lines of given orientation."""
+    text_value = extract_numeric_value(text.text)
+    if text_value is None:
+        return []
+    text_pos = ((text.bbox['x0'] + text.bbox['x1']) / 2, (text.bbox['y0'] + text.bbox['y1']) / 2)
+    matches = []
+    for line in [l for l in lines if l['orientation'] == orientation]:
+        dist = distance_to_midpoint(text_pos, midpoint(line))
+        if dist <= max_distance:
+            scale = line['length'] / (text_value / 1000) if text_value > 0 else 0
+            ratio = scale / 50 if scale > 0 else 0  # Placeholder nominal; adjust based on expected
+            matches.append({
+                'text_value': text_value,
+                'line_length_points': line['length'],
+                'calculated_scale': scale,
+                'distance_to_text_points': dist,
+                'ratio': 1.0  # Simplified; in full, compute relative to avg
+            })
+    matches.sort(key=lambda m: m['distance_to_text_points'])
+    return matches[:3]
+
+def determine_scale(matches: List[Dict], orientation: str) -> Optional[OrientationScale]:
+    """Validate and average top 3 matches by value."""
+    if len(matches) < 3:
+        return None  # Require min 3 for validation
+    matches.sort(key=lambda m: m['text_value'], reverse=True)  # Top by dimension value
+    top3 = matches[:3]
+    scales = [m['calculated_scale'] for m in top3]
+    avg_scale = sum(scales) / len(scales)
+    deviation = max(abs(s - avg_scale) for s in scales) / avg_scale * 100
+    if deviation > 2:
+        return None  # Fail validation
+    # Confidence calculation
+    conf = 100 - (deviation * 5)  # Base 100, deduct for deviation
+    conf = min(100, max(90, conf))  # Clamp
+    return OrientationScale(
+        points_per_meter=round(avg_scale, 2),
+        confidence=round(conf, 1),
+        validation_count=3,
+        lines_used=top3
+    )
+
+@sleep_and_retry
+@limits(calls=10, period=60)  # 10 req/min
+async def process_data(input_data: InputData) -> OutputData:
+    start_time = time.time()
+    all_texts = [text for page in input_data.pages for text in page.texts]
+    all_drawings = {k: [item for page in input_data.pages for item in page.drawings.get(k, [])] for k in ['lines']}
+    filtered_lines = filter_lines(all_drawings)
+    avg_length = sum(l['length'] for l in filtered_lines) / len(filtered_lines) if filtered_lines else 300
+    max_distance = max(50, min(100, avg_length * 0.1))
     
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logger.error(f"Error during pre-filtering: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    horiz_matches = []
+    vert_matches = []
+    for text in all_texts:
+        horiz_matches.extend(match_text_to_lines(text, tuple(filtered_lines), 'horizontal', max_distance))  # tuple for cache
+        vert_matches.extend(match_text_to_lines(text, tuple(filtered_lines), 'vertical', max_distance))
+    
+    horiz_scale = determine_scale(horiz_matches, 'horizontal')
+    vert_scale = determine_scale(vert_matches, 'vertical')
+    
+    if not horiz_scale or not vert_scale:
+        raise HTTPException(status_code=400, detail="Insufficient valid matches for scale determination")
+    
+    deviation = abs(horiz_scale.points_per_meter - vert_scale.points_per_meter) / max(horiz_scale.points_per_meter, vert_scale.points_per_meter) * 100
+    warnings = ["Significant scale deviation between orientations (>2%)"] if deviation > 2 else []
+    
+    stats = {
+        "lines_processed": len(filtered_lines),
+        "texts_processed": len(all_texts),
+        "dimension_lines_found": len([t for t in all_texts if extract_numeric_value(t.text) is not None]),
+        "processing_time_ms": round((time.time() - start_time) * 1000)
+    }
+    
+    return OutputData(
+        status="success",
+        scales={"horizontal": horiz_scale, "vertical": vert_scale},
+        dimension_lines=[],  # Future expansion
+        warnings=warnings,
+        processing_stats=stats
+    )
 
-@app.get("/health/")
+@app.post("/pre-scale", response_model=OutputData)
+async def pre_scale(request: Request, data: InputData):
+    logger.info(f"Processing request from {request.client.host}")
+    return await process_data(data)
+
+@app.get("/scale/{orientation}")
+async def get_scale(orientation: str):
+    # Placeholder; in production, cache or store scales
+    if orientation not in ["horizontal", "vertical"]:
+        raise HTTPException(status_code=400, detail="Invalid orientation")
+    # Simulate retrieval
+    return {"message": f"Scale for {orientation} retrieved (implement storage for real use)"}
+
+@app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "1.0.5", "min_line_length": 100}
+    return {"status": "healthy", "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), "version": "1.0.0"}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
