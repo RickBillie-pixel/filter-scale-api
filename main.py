@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from typing import List, Dict, Any, Optional, Tuple
 import math
-import numpy as np
 import re
 from functools import lru_cache
 import asyncio
@@ -15,8 +14,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Pre-Filter API", 
-    description="Filters vector data and texts for scale processing", 
+    title="Pre-Filter API",
+    description="Filters vector data and texts for scale processing",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -40,7 +39,7 @@ class Point(BaseModel):
 
 class BBox(BaseModel):
     x0: float = Field(..., description="Left boundary")
-    y0: float = Field(..., description="Top boundary") 
+    y0: float = Field(..., description="Top boundary")
     x1: float = Field(..., description="Right boundary")
     y1: float = Field(..., description="Bottom boundary")
     width: float = Field(..., description="Width of bounding box")
@@ -51,7 +50,7 @@ class Text(BaseModel):
     position: Dict[str, float] = Field(..., description="Text position coordinates")
     bbox: Optional[BBox] = Field(None, description="Bounding box of text")
     source: Optional[str] = Field(None, description="Source identifier")
-    
+
     @validator('position')
     def validate_position(cls, v):
         required_keys = {'x', 'y'}
@@ -61,10 +60,10 @@ class Text(BaseModel):
 
 class Line(BaseModel):
     p1: Dict[str, float] = Field(..., description="Start point coordinates")
-    p2: Dict[str, float] = Field(..., description="End point coordinates") 
+    p2: Dict[str, float] = Field(..., description="End point coordinates")
     length: float = Field(..., gt=0, description="Length of the line")
     width: Optional[float] = Field(None, description="Line width/thickness")
-    
+
     @validator('p1', 'p2')
     def validate_points(cls, v):
         required_keys = {'x', 'y'}
@@ -77,30 +76,19 @@ class Page(BaseModel):
     texts: List[Text] = Field(default_factory=list, description="Text elements on page")
     lines: List[Line] = Field(default_factory=list, description="Line elements on page (legacy format)")
     drawings: Optional[Dict[str, List[Dict[str, Any]]]] = Field(None, description="Vector drawings from Vector Drawing API")
-    
+
     def get_all_lines(self) -> List[Line]:
         """Extract lines from both legacy format and new drawings format"""
         all_lines = []
-        
-        # Legacy format: direct lines
         all_lines.extend(self.lines)
-        
-        # New format: lines inside drawings
         if self.drawings and "lines" in self.drawings:
             for line_data in self.drawings["lines"]:
                 try:
-                    # Convert drawing line format to our Line model
-                    line = Line(
-                        p1=line_data["p1"],
-                        p2=line_data["p2"], 
-                        length=line_data["length"],
-                        width=line_data.get("width")
-                    )
+                    line = Line(p1=line_data["p1"], p2=line_data["p2"], length=line_data["length"], width=line_data.get("width"))
                     all_lines.append(line)
                 except Exception as e:
                     logger.warning(f"Failed to parse line: {e}")
                     continue
-        
         return all_lines
 
 class FilterConfig(BaseModel):
@@ -115,16 +103,25 @@ class InputData(BaseModel):
 
 class ProcessedLine(BaseModel):
     p1: Dict[str, float]
-    p2: Dict[str, float] 
+    p2: Dict[str, float]
     length: float
     width: Optional[float]
     orientation: str
     midpoint: Tuple[float, float]
 
+class ProcessedText(BaseModel):
+    text: str
+    position: Dict[str, float]
+    bbox: Optional[BBox]
+    source: Optional[str]
+    orientation: str
+    numeric_value: Optional[float]
+    midpoint: Tuple[float, float]
+
 class ProcessedPage(BaseModel):
     page_number: int
-    texts: List[Dict[str, Any]]
-    lines: List[Dict[str, Any]]
+    texts: List[ProcessedText]
+    lines: List[ProcessedLine]
     stats: Dict[str, Any]
 
 class OutputData(BaseModel):
@@ -136,7 +133,7 @@ NUMERIC_PATTERN = re.compile(r'(\d+(?:\.\d+)?)')
 
 @lru_cache(maxsize=1000)
 def extract_numeric_value(text: str) -> Optional[float]:
-    """Extract numeric value from text with caching for repeated texts."""
+    """Extract numeric value from text, handling suffixes like '+p'."""
     match = NUMERIC_PATTERN.search(text)
     return float(match.group(1)) if match else None
 
@@ -145,14 +142,15 @@ def get_midpoint(p1: Dict[str, float], p2: Dict[str, float]) -> Tuple[float, flo
     return ((p1['x'] + p2['x']) / 2, (p1['y'] + p2['y']) / 2)
 
 def get_text_midpoint(text: Text) -> Tuple[float, float]:
-    """Get text midpoint from position."""
+    """Get text midpoint from position or bbox if available."""
+    if text.bbox:
+        return ((text.bbox.x0 + text.bbox.x1) / 2, (text.bbox.y0 + text.bbox.y1) / 2)
     return (text.position['x'], text.position['y'])
 
 def assign_orientation(line: Line, tolerance: float = 0.1) -> str:
     """Assign orientation to line based on slope."""
     dx = abs(line.p2['x'] - line.p1['x'])
     dy = abs(line.p2['y'] - line.p1['y'])
-    
     if dy / max(1, dx) < tolerance:
         return "horizontal"
     elif dx / max(1, dy) < tolerance:
@@ -163,57 +161,85 @@ def calculate_distance(point1: Tuple[float, float], point2: Tuple[float, float])
     """Calculate Euclidean distance between two points."""
     return math.hypot(point1[0] - point2[0], point1[1] - point2[1])
 
+def assign_text_orientation(text: Text, lines: List[Line], tolerance: float = 300) -> str:
+    """Assign orientation to text based on nearest line or bbox aspect ratio."""
+    midpoint = get_text_midpoint(text)
+    nearest_distance = float('inf')
+    nearest_orientation = None
+    for line in lines:
+        line_midpoint = get_midpoint(line.p1, line.p2)
+        distance = calculate_distance(midpoint, line_midpoint)
+        if distance < nearest_distance and distance < tolerance:
+            nearest_distance = distance
+            nearest_orientation = assign_orientation(line)
+    if nearest_orientation and nearest_orientation in ["horizontal", "vertical"]:
+        return nearest_orientation
+    if text.bbox:
+        width, height = text.bbox.width, text.bbox.height
+        if width > height and height < 15:
+            return "horizontal"
+        elif height > width and width < 15:
+            return "vertical"
+    return "unknown"
+
 def process_page_data(page: Page, config: FilterConfig) -> ProcessedPage:
     """Process a single page - CPU intensive operation."""
-    
-    # Text Filtering - keep ALL texts or only numeric based on config
-    if config.keep_all_text:
-        # Keep ALL text types - no filtering
-        filtered_texts = page.texts.copy()
-        logger.info(f"Keeping all {len(filtered_texts)} texts")
-    else:
-        # Original behavior - only texts with numeric values
-        filtered_texts = [
-            t for t in page.texts 
-            if extract_numeric_value(t.text) is not None
-        ]
-        # Sort by numeric value (highest first)
-        filtered_texts.sort(
-            key=lambda t: extract_numeric_value(t.text) or 0, 
-            reverse=True
-        )
-        logger.info(f"Filtered to {len(filtered_texts)} numeric texts")
-    
-    # Get all lines from both legacy and new format
+    # Text Processing
+    processed_texts = []
+    for text in page.texts:
+        midpoint = get_text_midpoint(text)
+        numeric_value = extract_numeric_value(text.text)
+        orientation = assign_text_orientation(text, page.get_all_lines(), 300)
+        processed_texts.append(ProcessedText(
+            text=text.text,
+            position=text.position,
+            bbox=text.bbox,
+            source=text.source,
+            orientation=orientation,
+            numeric_value=numeric_value,
+            midpoint=midpoint
+        ))
+    logger.info(f"Processed all {len(processed_texts)} texts with center points and orientations")
+
+    # Line Processing
     all_lines = page.get_all_lines()
     original_line_count = len(all_lines)
-    
-    logger.info(f"Processing {original_line_count} lines with min_length={config.min_line_length}")
-    
-    # Line Filtering - keep ALL lines above minimum length
     filtered_lines = []
-    
     for line in all_lines:
-        # Only check line length - no other filtering
         if line.length >= config.min_line_length:
             orientation = assign_orientation(line, config.diagonal_tolerance)
-            
-            # Include all orientations if diagonal lines are enabled
             if config.include_diagonal_lines or orientation != "diagonal":
-                line_dict = line.dict()
-                line_dict["orientation"] = orientation
-                line_dict["midpoint"] = get_midpoint(line.p1, line.p2)
-                filtered_lines.append(line_dict)
-    
-    logger.info(f"Filtered to {len(filtered_lines)} lines (min length: {config.min_line_length}) - NO DEDUPLICATION")
-    
+                filtered_lines.append(ProcessedLine(
+                    p1=line.p1,
+                    p2=line.p2,
+                    length=line.length,
+                    width=line.width,
+                    orientation=orientation,
+                    midpoint=get_midpoint(line.p1, line.p2)
+                ))
+    logger.info(f"Filtered to {len(filtered_lines)} lines (min length: {config.min_line_length})")
+
+    # Track highest dimensions
+    highest_dimensions = {
+        "horizontal": max(
+            [t for t in processed_texts if t.orientation == "horizontal" and t.numeric_value is not None],
+            key=lambda x: x.numeric_value,
+            default=ProcessedText(text="", position={"x": 0, "y": 0}, bbox=None, source=None, orientation="horizontal", numeric_value=0, midpoint=(0, 0))
+        ),
+        "vertical": max(
+            [t for t in processed_texts if t.orientation == "vertical" and t.numeric_value is not None],
+            key=lambda x: x.numeric_value,
+            default=ProcessedText(text="", position={"x": 0, "y": 0}, bbox=None, source=None, orientation="vertical", numeric_value=0, midpoint=(0, 0))
+        )
+    }
+
     return ProcessedPage(
         page_number=page.page_number,
-        texts=[t.dict() for t in filtered_texts],
+        texts=processed_texts,
         lines=filtered_lines,
         stats={
             "original_texts": len(page.texts),
-            "filtered_texts": len(filtered_texts),
+            "filtered_texts": len(processed_texts),
             "original_lines": original_line_count,
             "filtered_lines": len(filtered_lines),
             "deduplication": "disabled",
@@ -221,6 +247,10 @@ def process_page_data(page: Page, config: FilterConfig) -> ProcessedPage:
                 "min_line_length": config.min_line_length,
                 "keep_all_text": config.keep_all_text,
                 "include_diagonal_lines": config.include_diagonal_lines
+            },
+            "highest_dimensions": {
+                "horizontal": {"text": highest_dimensions["horizontal"].text, "numeric_value": highest_dimensions["horizontal"].numeric_value},
+                "vertical": {"text": highest_dimensions["vertical"].text, "numeric_value": highest_dimensions["vertical"].numeric_value}
             }
         }
     )
@@ -233,11 +263,7 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Detailed health check."""
-    return {
-        "status": "healthy",
-        "service": "Pre-Filter API",
-        "version": "1.0.0"
-    }
+    return {"status": "healthy", "service": "Pre-Filter API", "version": "1.0.0"}
 
 @app.post("/pre-scale", response_model=OutputData)
 @app.post("/pre-filter/", response_model=OutputData)
@@ -246,37 +272,27 @@ async def pre_filter(data: InputData):
     Filter vector data and texts for scale processing.
     
     **New filtering behavior:**
-    - **Texts**: Keeps ALL text types by default (labels, descriptions, dimensions, etc.)
-    - **Lines**: Only lines with length >= 45 (configurable)
+    - **Texts**: Keeps ALL text types by default, calculates center points, extracts numeric values, assigns orientations
+    - **Lines**: Filters on length >= 45, determines orientations, calculates midpoints
     - **No deduplication**: All qualifying lines are kept
     
     - **pages**: List of pages containing texts and lines
     - **config**: Optional filtering configuration
-        - min_line_length: 45.0 (default, was 10.0)
+        - min_line_length: 45.0 (default)
         - keep_all_text: true (default, keeps ALL text)
         - include_diagonal_lines: true (default, includes all orientations)
     """
     try:
         start_time = asyncio.get_event_loop().time()
-        
-        # Process pages concurrently for better performance
         loop = asyncio.get_event_loop()
-        tasks = [
-            loop.run_in_executor(executor, process_page_data, page, data.config)
-            for page in data.pages
-        ]
-        
+        tasks = [loop.run_in_executor(executor, process_page_data, page, data.config) for page in data.pages]
         processed_pages = await asyncio.gather(*tasks)
-        
         end_time = asyncio.get_event_loop().time()
         processing_time = end_time - start_time
-        
-        # Calculate overall statistics
         total_original_texts = sum(p.stats["original_texts"] for p in processed_pages)
         total_filtered_texts = sum(p.stats["filtered_texts"] for p in processed_pages)
         total_original_lines = sum(p.stats["original_lines"] for p in processed_pages)
         total_filtered_lines = sum(p.stats["filtered_lines"] for p in processed_pages)
-        
         return OutputData(
             pages=processed_pages,
             processing_stats={
@@ -289,7 +305,6 @@ async def pre_filter(data: InputData):
                 "filter_config": data.config.dict()
             }
         )
-        
     except Exception as e:
         logger.error(f"Error processing data: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
@@ -308,14 +323,5 @@ async def pre_filter_batch(data_batches: List[InputData]):
 if __name__ == "__main__":
     import uvicorn
     import os
-    
     port = int(os.environ.get("PORT", 10000))
-    
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=port,
-        log_level="info",
-        access_log=True,
-        reload=False
-    )
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", access_log=True, reload=False)
