@@ -99,7 +99,7 @@ class ProcessedPage(BaseModel):
     page_number: int
     texts: List[Dict[str, Any]]
     lines: List[Dict[str, Any]]
-    stats: Dict[str, int]
+    stats: Dict[str, Any]  # Changed from int to Any to allow nested dicts
 
 class OutputData(BaseModel):
     pages: List[ProcessedPage]
@@ -160,7 +160,13 @@ def process_page_data(page: Page, config: FilterConfig) -> ProcessedPage:
     
     # Line Filtering - much simpler, no text association
     filtered_lines = []
-    for line in page.lines:
+    original_line_count = len(page.lines)
+    
+    logger.info(f"Processing {original_line_count} lines with min_length={config.min_line_length}")
+    
+    for i, line in enumerate(page.lines):
+        logger.debug(f"Line {i}: length={line.length}")
+        
         # Only check line length - no text proximity filtering
         if line.length >= config.min_line_length:
             orientation = assign_orientation(line, config.diagonal_tolerance)
@@ -171,6 +177,11 @@ def process_page_data(page: Page, config: FilterConfig) -> ProcessedPage:
                 line_dict["orientation"] = orientation
                 line_dict["midpoint"] = get_midpoint(line.p1, line.p2)
                 filtered_lines.append(line_dict)
+                logger.debug(f"Line {i} kept: length={line.length}, orientation={orientation}")
+            else:
+                logger.debug(f"Line {i} filtered out: diagonal not included")
+        else:
+            logger.debug(f"Line {i} filtered out: length {line.length} < {config.min_line_length}")
     
     logger.info(f"Filtered to {len(filtered_lines)} lines (min length: {config.min_line_length})")
     
@@ -225,14 +236,51 @@ async def health_check():
         "version": "1.0.0"
     }
 
+@app.post("/debug-input/")
+async def debug_input(data: InputData):
+    """Debug endpoint to inspect incoming data structure"""
+    try:
+        debug_info = {
+            "total_pages": len(data.pages),
+            "config": data.config.dict(),
+            "pages_summary": []
+        }
+        
+        for i, page in enumerate(data.pages):
+            page_info = {
+                "page_number": page.page_number,
+                "total_texts": len(page.texts),
+                "total_lines": len(page.lines),
+                "line_lengths": [line.length for line in page.lines[:10]],  # First 10 line lengths
+                "sample_texts": [text.text[:50] for text in page.texts[:5]]  # First 5 texts (truncated)
+            }
+            debug_info["pages_summary"].append(page_info)
+            
+            if i >= 2:  # Only show first 3 pages to avoid huge response
+                break
+        
+        return debug_info
+        
+    except Exception as e:
+        logger.error(f"Debug error: {str(e)}")
+        return {"error": str(e)}
+
 @app.post("/pre-scale", response_model=OutputData)
 @app.post("/pre-filter/", response_model=OutputData)
 async def pre_filter(data: InputData):
     """
     Filter vector data and texts for scale processing.
     
+    **New filtering behavior:**
+    - **Texts**: Keeps ALL text types by default (labels, descriptions, dimensions, etc.)
+    - **Lines**: Only lines with length >= 45 (configurable)
+    - **No proximity filtering**: Lines don't need to be near text
+    
     - **pages**: List of pages containing texts and lines
     - **config**: Optional filtering configuration
+        - min_line_length: 45.0 (default, was 10.0)
+        - keep_all_text: true (default, keeps ALL text)
+        - include_diagonal_lines: true (default, includes all orientations)
     """
     try:
         start_time = asyncio.get_event_loop().time()
