@@ -214,25 +214,7 @@ def process_page_data(page: Page, config: FilterConfig) -> ProcessedPage:
     
     logger.info(f"Filtered to {len(filtered_lines)} lines (min length: {config.min_line_length})")
     
-    # Simple deduplication based on coordinates and length
-    unique_lines = []
-    seen_keys = set()
-    
-    for line in filtered_lines:
-        # Create unique key based on rounded coordinates and length
-        key = (
-            round(line['length'], 1),
-            round(line['p1']['x'], 1),
-            round(line['p1']['y'], 1),
-            round(line['p2']['x'], 1),
-            round(line['p2']['y'], 1)
-        )
-        
-        if key not in seen_keys:
-            seen_keys.add(key)
-            unique_lines.append(line)
-    
-    logger.info(f"After deduplication: {len(unique_lines)} unique lines")
+
     
     return ProcessedPage(
         page_number=page.page_number,
