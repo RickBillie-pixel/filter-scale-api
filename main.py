@@ -125,7 +125,7 @@ class ProcessedPage(BaseModel):
     page_number: int
     texts: List[Dict[str, Any]]
     lines: List[Dict[str, Any]]
-    stats: Dict[str, Any]  # Changed from int to Any to allow nested dicts
+    stats: Dict[str, Any]
 
 class OutputData(BaseModel):
     pages: List[ProcessedPage]
@@ -190,13 +190,11 @@ def process_page_data(page: Page, config: FilterConfig) -> ProcessedPage:
     
     logger.info(f"Processing {original_line_count} lines with min_length={config.min_line_length}")
     
-    # Line Filtering - much simpler, no text association
+    # Line Filtering - keep ALL lines above minimum length
     filtered_lines = []
     
-    for i, line in enumerate(all_lines):
-        logger.debug(f"Line {i}: length={line.length}")
-        
-        # Only check line length - no text proximity filtering
+    for line in all_lines:
+        # Only check line length - no other filtering
         if line.length >= config.min_line_length:
             orientation = assign_orientation(line, config.diagonal_tolerance)
             
@@ -206,25 +204,19 @@ def process_page_data(page: Page, config: FilterConfig) -> ProcessedPage:
                 line_dict["orientation"] = orientation
                 line_dict["midpoint"] = get_midpoint(line.p1, line.p2)
                 filtered_lines.append(line_dict)
-                logger.debug(f"Line {i} kept: length={line.length}, orientation={orientation}")
-            else:
-                logger.debug(f"Line {i} filtered out: diagonal not included")
-        else:
-            logger.debug(f"Line {i} filtered out: length {line.length} < {config.min_line_length}")
     
-    logger.info(f"Filtered to {len(filtered_lines)} lines (min length: {config.min_line_length})")
-    
-
+    logger.info(f"Filtered to {len(filtered_lines)} lines (min length: {config.min_line_length}) - NO DEDUPLICATION")
     
     return ProcessedPage(
         page_number=page.page_number,
         texts=[t.dict() for t in filtered_texts],
-        lines=unique_lines,
+        lines=filtered_lines,
         stats={
             "original_texts": len(page.texts),
             "filtered_texts": len(filtered_texts),
             "original_lines": original_line_count,
-            "filtered_lines": len(unique_lines),
+            "filtered_lines": len(filtered_lines),
+            "deduplication": "disabled",
             "filter_config_used": {
                 "min_line_length": config.min_line_length,
                 "keep_all_text": config.keep_all_text,
@@ -247,40 +239,6 @@ async def health_check():
         "version": "1.0.0"
     }
 
-@app.post("/debug-input/")
-async def debug_input(data: InputData):
-    """Debug endpoint to inspect incoming data structure"""
-    try:
-        debug_info = {
-            "total_pages": len(data.pages),
-            "config": data.config.dict(),
-            "pages_summary": []
-        }
-        
-        for i, page in enumerate(data.pages):
-            all_lines = page.get_all_lines()
-            
-            page_info = {
-                "page_number": page.page_number,
-                "total_texts": len(page.texts),
-                "legacy_lines": len(page.lines),
-                "drawings_lines": len(page.drawings.get("lines", [])) if page.drawings else 0,
-                "total_lines": len(all_lines),
-                "line_lengths": [line.length for line in all_lines[:10]],  # First 10 line lengths
-                "lines_above_45": sum(1 for line in all_lines if line.length >= 45),
-                "sample_texts": [text.text[:50] for text in page.texts[:5]]  # First 5 texts (truncated)
-            }
-            debug_info["pages_summary"].append(page_info)
-            
-            if i >= 2:  # Only show first 3 pages to avoid huge response
-                break
-        
-        return debug_info
-        
-    except Exception as e:
-        logger.error(f"Debug error: {str(e)}")
-        return {"error": str(e)}
-
 @app.post("/pre-scale", response_model=OutputData)
 @app.post("/pre-filter/", response_model=OutputData)
 async def pre_filter(data: InputData):
@@ -290,7 +248,7 @@ async def pre_filter(data: InputData):
     **New filtering behavior:**
     - **Texts**: Keeps ALL text types by default (labels, descriptions, dimensions, etc.)
     - **Lines**: Only lines with length >= 45 (configurable)
-    - **No proximity filtering**: Lines don't need to be near text
+    - **No deduplication**: All qualifying lines are kept
     
     - **pages**: List of pages containing texts and lines
     - **config**: Optional filtering configuration
