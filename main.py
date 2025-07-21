@@ -75,7 +75,33 @@ class Line(BaseModel):
 class Page(BaseModel):
     page_number: int = Field(..., ge=1, description="Page number (1-indexed)")
     texts: List[Text] = Field(default_factory=list, description="Text elements on page")
-    lines: List[Line] = Field(default_factory=list, description="Line elements on page")
+    lines: List[Line] = Field(default_factory=list, description="Line elements on page (legacy format)")
+    drawings: Optional[Dict[str, List[Dict[str, Any]]]] = Field(None, description="Vector drawings from Vector Drawing API")
+    
+    def get_all_lines(self) -> List[Line]:
+        """Extract lines from both legacy format and new drawings format"""
+        all_lines = []
+        
+        # Legacy format: direct lines
+        all_lines.extend(self.lines)
+        
+        # New format: lines inside drawings
+        if self.drawings and "lines" in self.drawings:
+            for line_data in self.drawings["lines"]:
+                try:
+                    # Convert drawing line format to our Line model
+                    line = Line(
+                        p1=line_data["p1"],
+                        p2=line_data["p2"], 
+                        length=line_data["length"],
+                        width=line_data.get("width")
+                    )
+                    all_lines.append(line)
+                except Exception as e:
+                    logger.warning(f"Failed to parse line: {e}")
+                    continue
+        
+        return all_lines
 
 class FilterConfig(BaseModel):
     min_line_length: float = Field(45.0, gt=0, description="Minimum line length to include")
@@ -158,13 +184,16 @@ def process_page_data(page: Page, config: FilterConfig) -> ProcessedPage:
         )
         logger.info(f"Filtered to {len(filtered_texts)} numeric texts")
     
-    # Line Filtering - much simpler, no text association
-    filtered_lines = []
-    original_line_count = len(page.lines)
+    # Get all lines from both legacy and new format
+    all_lines = page.get_all_lines()
+    original_line_count = len(all_lines)
     
     logger.info(f"Processing {original_line_count} lines with min_length={config.min_line_length}")
     
-    for i, line in enumerate(page.lines):
+    # Line Filtering - much simpler, no text association
+    filtered_lines = []
+    
+    for i, line in enumerate(all_lines):
         logger.debug(f"Line {i}: length={line.length}")
         
         # Only check line length - no text proximity filtering
@@ -212,7 +241,7 @@ def process_page_data(page: Page, config: FilterConfig) -> ProcessedPage:
         stats={
             "original_texts": len(page.texts),
             "filtered_texts": len(filtered_texts),
-            "original_lines": len(page.lines),
+            "original_lines": original_line_count,
             "filtered_lines": len(unique_lines),
             "filter_config_used": {
                 "min_line_length": config.min_line_length,
@@ -247,11 +276,16 @@ async def debug_input(data: InputData):
         }
         
         for i, page in enumerate(data.pages):
+            all_lines = page.get_all_lines()
+            
             page_info = {
                 "page_number": page.page_number,
                 "total_texts": len(page.texts),
-                "total_lines": len(page.lines),
-                "line_lengths": [line.length for line in page.lines[:10]],  # First 10 line lengths
+                "legacy_lines": len(page.lines),
+                "drawings_lines": len(page.drawings.get("lines", [])) if page.drawings else 0,
+                "total_lines": len(all_lines),
+                "line_lengths": [line.length for line in all_lines[:10]],  # First 10 line lengths
+                "lines_above_45": sum(1 for line in all_lines if line.length >= 45),
                 "sample_texts": [text.text[:50] for text in page.texts[:5]]  # First 5 texts (truncated)
             }
             debug_info["pages_summary"].append(page_info)
