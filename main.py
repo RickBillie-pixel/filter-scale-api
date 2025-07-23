@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Filter API",
-    description="Filters lines per region based on drawing type, passing all texts with original coordinates unfiltered",
-    version="2.0.0",
+    description="Filters lines per region based on drawing type, returns minified output for Scale API",
+    version="2.1.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -94,48 +94,39 @@ class FilterInput(BaseModel):
     vector_data: VectorData
     vision_output: VisionOutput
 
-class FilteredLine(BaseModel):
-    p1: List[float]
-    p2: List[float]
-    stroke_width: float
+# Minified output models for Scale API compatibility
+class ScaleApiPoint(BaseModel):
+    x: float
+    y: float
+
+class ScaleApiLine(BaseModel):
+    type: str = "line"
+    p1: ScaleApiPoint
+    p2: ScaleApiPoint
     length: float
-    color: List[int]
-    is_dashed: bool
-    angle: Optional[float]
     orientation: str
+    midpoint: ScaleApiPoint
 
-class FilteredRegion(BaseModel):
+class ScaleApiText(BaseModel):
+    text: str
+    position: ScaleApiPoint
+
+class RegionOutput(BaseModel):
     label: str
-    bounding_box: List[float]
-    lines: List[FilteredLine]
-    texts: List[VectorText]
+    vector_data: List[ScaleApiLine]
+    texts: List[ScaleApiText]
 
-class UnassignedElements(BaseModel):
-    lines: List[FilteredLine]
-    texts: List[VectorText]
-
-class FilteredData(BaseModel):
-    page_number: int
+class MinifiedOutput(BaseModel):
     drawing_type: str
-    scale_api_version: str
-    regions: List[FilteredRegion]
-    unassigned: UnassignedElements
-
-class Metadata(BaseModel):
-    processed_elements: int
-    filtered_elements: int
-    regions_processed: int
-    processing_time_seconds: float
-    timestamp: str
-    config_used: Dict[str, str]
-
-class FilterOutput(BaseModel):
-    filtered: FilteredData
-    metadata: Metadata
-    errors: List[str] = Field(default_factory=list)
+    page_number: int
+    regions: List[RegionOutput]
+    unassigned_vector_data: List[ScaleApiLine]
+    unassigned_texts: List[ScaleApiText]
+    metadata: Dict[str, Any]
 
 # Helper functions
 def calculate_orientation(p1: List[float], p2: List[float], angle: Optional[float] = None) -> str:
+    """Calculate line orientation"""
     if angle is not None:
         normalized_angle = abs(angle % 180)
         if normalized_angle < 10 or normalized_angle > 170:
@@ -161,35 +152,64 @@ def calculate_orientation(p1: List[float], p2: List[float], angle: Optional[floa
             else:
                 return "diagonal"
 
+def calculate_midpoint(p1: List[float], p2: List[float]) -> ScaleApiPoint:
+    """Calculate midpoint of a line"""
+    return ScaleApiPoint(
+        x=round((p1[0] + p2[0]) / 2, 2),
+        y=round((p1[1] + p2[1]) / 2, 2)
+    )
+
 def line_in_region(line_p1: List[float], line_p2: List[float], region: List[float], buffer: float = 0) -> bool:
+    """Check if line intersects with region"""
     line = LineString([line_p1, line_p2])
     region_box = box(region[0] - buffer, region[1] - buffer, region[2] + buffer, region[3] + buffer)
     return line.intersects(region_box)
 
 def text_in_region(text: VectorText, region: List[float], buffer: float = 0) -> bool:
+    """Check if text is in region"""
     center_x = (text.bounding_box[0] + text.bounding_box[2]) / 2
     center_y = (text.bounding_box[1] + text.bounding_box[3]) / 2
-    return center_x >= region[0] - buffer and center_x <= region[2] + buffer and \
-           center_y >= region[1] - buffer and center_y <= region[3] + buffer
+    return (center_x >= region[0] - buffer and center_x <= region[2] + buffer and
+            center_y >= region[1] - buffer and center_y <= region[3] + buffer)
 
 def calculate_region_area(region: List[float]) -> float:
+    """Calculate region area"""
     x1, y1, x2, y2 = region
     return abs((x2 - x1) * (y2 - y1))
 
-@app.post("/filter/")
+def convert_line_to_scale_format(line: VectorLine) -> ScaleApiLine:
+    """Convert line to Scale API format with midpoint"""
+    orientation = calculate_orientation(line.p1, line.p2, line.angle)
+    midpoint = calculate_midpoint(line.p1, line.p2)
+    
+    return ScaleApiLine(
+        type="line",
+        p1=ScaleApiPoint(x=round(line.p1[0], 2), y=round(line.p1[1], 2)),
+        p2=ScaleApiPoint(x=round(line.p2[0], 2), y=round(line.p2[1], 2)),
+        length=round(line.length, 2),
+        orientation=orientation,
+        midpoint=midpoint
+    )
+
+def convert_text_to_scale_format(text: VectorText) -> ScaleApiText:
+    """Convert text to Scale API format"""
+    return ScaleApiText(
+        text=text.text,
+        position=ScaleApiPoint(x=round(text.position[0], 2), y=round(text.position[1], 2))
+    )
+
+@app.post("/filter/", response_model=MinifiedOutput)
 @limiter.limit("10/minute")
 async def filter_data(request: Request, input_data: FilterInput, debug: bool = Query(False)):
-    """Filter lines per region based on drawing type, passing all texts unfiltered with original coordinates."""
+    """Filter lines per region and return minified output for Scale API"""
     start_time = datetime.now()
-    errors = []
     
     try:
+        # Validate input
         if not input_data.vector_data.pages:
-            errors.append("No pages in vector_data")
             raise HTTPException(status_code=400, detail="No pages in vector_data")
         
         if input_data.vision_output.drawing_type in ["detailtekening", "unknown"] and not input_data.vision_output.regions:
-            errors.append(f"No regions provided for {input_data.vision_output.drawing_type}")
             raise HTTPException(status_code=400, detail=f"No regions provided for {input_data.vision_output.drawing_type}")
         
         vector_page = input_data.vector_data.pages[0]
@@ -197,13 +217,16 @@ async def filter_data(request: Request, input_data: FilterInput, debug: bool = Q
         regions = input_data.vision_output.regions
         
         logger.info(f"Processing page {input_data.vector_data.page_number} of type {drawing_type}")
+        logger.info(f"Input: {len(vector_page.lines)} lines, {len(vector_page.texts)} texts")
         
         original_count = len(vector_page.lines) + len(vector_page.texts)
         
-        filtered_regions = []
-        unassigned_lines = []
-        unassigned_texts = vector_page.texts.copy()  # All texts unfiltered, start as unassigned
+        # Process regions
+        region_outputs = []
+        unassigned_texts = vector_page.texts.copy()
+        processed_lines = set()
         
+        # For unknown drawing type, select largest region
         if drawing_type == "unknown" and regions:
             regions = [max(regions, key=lambda r: calculate_region_area(r.coordinate_block))]
         
@@ -211,117 +234,107 @@ async def filter_data(request: Request, input_data: FilterInput, debug: bool = Q
             region_lines = []
             region_texts = []
             
-            # Include all texts in region
+            # Process texts for this region
             texts_to_remove = []
             for text in unassigned_texts:
                 if text_in_region(text, region.coordinate_block, buffer=15 if drawing_type != "bestektekening" else 0):
-                    region_texts.append(text)
+                    region_texts.append(convert_text_to_scale_format(text))
                     texts_to_remove.append(text)
             
+            # Remove assigned texts from unassigned list
             for text in texts_to_remove:
                 unassigned_texts.remove(text)
             
-            # Filter lines based on drawing_type
-            for line in vector_page.lines:
+            # Process lines for this region based on drawing type rules
+            for i, line in enumerate(vector_page.lines):
+                if i in processed_lines:
+                    continue
+                    
                 orientation = calculate_orientation(line.p1, line.p2, line.angle)
                 include = False
                 buffer = 15 if drawing_type != "bestektekening" else 0
                 
                 if line_in_region(line.p1, line.p2, region.coordinate_block, buffer=buffer):
+                    # Apply drawing type specific filtering rules
                     if drawing_type == "plattegrond":
-                        include = True
+                        include = True  # All lines
                     elif drawing_type == "gevelaanzicht":
-                        include = line.length > 40
+                        include = line.length > 40  # Lines > 40pt
                     elif drawing_type == "detailtekening":
-                        include = line.length > 25
+                        include = line.length > 25  # Lines > 25pt
                     elif drawing_type == "doorsnede":
+                        # Vertical lines > 30pt OR dashed lines
                         include = (line.length > 30 and orientation == "vertical") or line.is_dashed
                     elif drawing_type == "bestektekening":
-                        include = True  # All lines, as per general rule
+                        # Apply region-specific rules for bestektekening
+                        label_lower = region.label.lower()
+                        if "grond" in label_lower:
+                            include = True  # Plattegrond rules: all lines
+                        elif "gevel" in label_lower:
+                            include = line.length > 40  # Gevel rules
+                        elif "doorsnede" in label_lower:
+                            include = line.length > 30 and orientation == "vertical"  # Doorsnede rules
+                        else:
+                            include = True  # Default: all lines
                     elif drawing_type == "installatietekening":
+                        # Lines ≤ 1pt stroke OR dashed lines
                         include = line.stroke_width <= 1 or line.is_dashed
                     elif drawing_type == "unknown":
-                        include = line.length > 10
+                        include = line.length > 10  # Lines > 10pt
                 
                 if include:
-                    filtered_line = FilteredLine(
-                        p1=line.p1,
-                        p2=line.p2,
-                        stroke_width=line.stroke_width,
-                        length=line.length,
-                        color=line.color,
-                        is_dashed=line.is_dashed,
-                        angle=line.angle,
-                        orientation=orientation
-                    )
-                    region_lines.append(filtered_line)
+                    region_lines.append(convert_line_to_scale_format(line))
+                    processed_lines.add(i)
             
-            filtered_regions.append(FilteredRegion(
+            # Create region output
+            region_output = RegionOutput(
                 label=region.label,
-                bounding_box=region.coordinate_block,
-                lines=region_lines,
-                texts=region_texts,
-                symbols=[]  # No symbols
-            ))
-        
-        # Handle unassigned lines
-        for line in vector_page.lines:
-            orientation = calculate_orientation(line.p1, line.p2, line.angle)
-            if all(not line_in_region(line.p1, line.p2, r.coordinate_block, buffer=15 if drawing_type != "bestektekening" else 0) for r in regions):
-                filtered_line = FilteredLine(
-                    p1=line.p1,
-                    p2=line.p2,
-                    stroke_width=line.stroke_width,
-                    length=line.length,
-                    color=line.color,
-                    is_dashed=line.is_dashed,
-                    angle=line.angle,
-                    orientation=orientation
-                )
-                unassigned_lines.append(filtered_line)
-        
-        filtered_data = FilteredData(
-            page_number=input_data.vector_data.page_number,
-            drawing_type=drawing_type,
-            scale_api_version=input_data.vision_output.scale_api_version,
-            regions=filtered_regions,
-            unassigned=UnassignedElements(
-                lines=unassigned_lines,
-                texts=unassigned_texts,
-                symbols=[]
+                vector_data=region_lines,
+                texts=region_texts
             )
-        )
+            region_outputs.append(region_output)
+            
+            logger.info(f"Region '{region.label}': {len(region_lines)} lines, {len(region_texts)} texts")
         
-        filtered_count = sum(
-            len(r.lines) + len(r.texts)
-            for r in filtered_regions
-        ) + len(unassigned_lines) + len(unassigned_texts)
+        # Process unassigned lines
+        unassigned_lines = []
+        for i, line in enumerate(vector_page.lines):
+            if i not in processed_lines:
+                unassigned_lines.append(convert_line_to_scale_format(line))
         
+        # Convert unassigned texts
+        unassigned_texts_converted = [convert_text_to_scale_format(text) for text in unassigned_texts]
+        
+        # Calculate processing stats
+        total_filtered_lines = sum(len(r.vector_data) for r in region_outputs) + len(unassigned_lines)
+        total_filtered_texts = sum(len(r.texts) for r in region_outputs) + len(unassigned_texts_converted)
         processing_time = (datetime.now() - start_time).total_seconds()
         
-        metadata = Metadata(
-            processed_elements=original_count,
-            filtered_elements=filtered_count,
-            regions_processed=len(regions),
-            processing_time_seconds=processing_time,
-            timestamp=datetime.now().isoformat(),
-            config_used={
+        # Create minified output
+        output = MinifiedOutput(
+            drawing_type=drawing_type,
+            page_number=input_data.vector_data.page_number,
+            regions=region_outputs,
+            unassigned_vector_data=unassigned_lines,
+            unassigned_texts=unassigned_texts_converted,
+            metadata={
+                "processed_elements": original_count,
+                "filtered_lines": total_filtered_lines,
+                "filtered_texts": total_filtered_texts,
+                "regions_processed": len(regions),
+                "processing_time_seconds": round(processing_time, 3),
+                "timestamp": datetime.now().isoformat(),
                 "scale_api_version": input_data.vision_output.scale_api_version
             }
         )
         
-        logger.info(f"Processed {original_count} elements, filtered {filtered_count} elements")
+        logger.info(f"✅ Filtering completed:")
+        logger.info(f"  Original: {original_count} elements")
+        logger.info(f"  Filtered: {total_filtered_lines} lines, {total_filtered_texts} texts")
+        logger.info(f"  Regions: {len(region_outputs)}")
+        logger.info(f"  Processing time: {processing_time:.3f}s")
         
-        response = FilterOutput(
-            filtered=filtered_data,
-            metadata=metadata,
-            errors=errors
-        )
-        
-        if debug:
-            logger.info(f"Debug mode: raw vector data has {len(vector_page.lines)} lines, {len(vector_page.texts)} texts")
-        
-        return response
+        return output
     
     except HTTPException as e:
         raise e
@@ -334,15 +347,42 @@ async def filter_data(request: Request, input_data: FilterInput, debug: bool = Q
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    """Health check endpoint"""
     return {
         "status": "healthy",
         "service": "Filter API",
-        "version": "2.0.0",
+        "version": "2.1.0",
+        "description": "Minified output for Scale API compatibility",
         "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "title": "Filter API",
+        "version": "2.1.0",
+        "description": "Filters lines per region based on drawing type, returns minified output for Scale API",
+        "features": [
+            "Region-based line filtering with drawing type rules",
+            "Minified output format for Scale API",
+            "Line midpoint calculation",
+            "Optimized text processing",
+            "No symbols (skipped for performance)"
+        ],
+        "drawing_types": {
+            "plattegrond": "All lines included",
+            "gevelaanzicht": "Lines > 40pt",
+            "detailtekening": "Lines > 25pt", 
+            "doorsnede": "Vertical lines > 30pt OR dashed lines",
+            "bestektekening": "Region-specific rules (grond=all, gevel>40pt, doorsnede=vertical>30pt)",
+            "installatietekening": "Lines ≤ 1pt stroke OR dashed",
+            "unknown": "Lines > 10pt in largest region"
+        },
+        "output_format": "Minified for Scale API compatibility with midpoints"
     }
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
