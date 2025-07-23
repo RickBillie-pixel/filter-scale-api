@@ -1,4 +1,4 @@
-# main.py
+# main.py (zonder Redis)
 import os
 import logging
 import json
@@ -10,7 +10,6 @@ from pydantic import BaseModel, Field, validator
 from shapely.geometry import Point, LineString, Polygon, box
 from shapely.affinity import scale as shapely_scale
 import math
-from redis import Redis
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -27,7 +26,7 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-# CORS middleware (restricted for security)
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Replace with specific origins in production
@@ -36,13 +35,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Rate limiting
+# Rate limiting (zonder Redis - gebruikt in-memory storage)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
-# Caching with Redis (configure Redis URL in env for production)
-redis = Redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
 
 class VectorLine(BaseModel):
     p1: List[float] = Field(..., min_items=2, max_items=2)
@@ -105,7 +101,7 @@ class ImageMetadata(BaseModel):
 class VisionOutput(BaseModel):
     drawing_type: str = Field(..., pattern="^(plattegrond|gevelaanzicht|detailtekening|doorsnede|bestektekening|installatietekening|unknown)$")
     scale_api_version: str = Field(..., min_length=1)
-    regions: List[VisionRegion] = Field(..., min_items=0)  # Allow empty regions for specific cases
+    regions: List[VisionRegion] = Field(..., min_items=0)
     image_metadata: ImageMetadata
 
 class FilterInput(BaseModel):
@@ -120,7 +116,7 @@ class FilteredLine(BaseModel):
     color: List[int]
     is_dashed: bool
     angle: Optional[float]
-    orientation: str  # "horizontal", "vertical", "diagonal"
+    orientation: str
 
 class FilteredRegion(BaseModel):
     label: str
@@ -226,7 +222,7 @@ async def filter_data(request: Request, input_data: FilterInput, debug: bool = Q
             errors.append(f"No regions provided for {input_data.vision_output.drawing_type}")
             raise HTTPException(status_code=400, detail=f"No regions provided for {input_data.vision_output.drawing_type}")
         
-        # Process first page (extend for multi-page if needed)
+        # Process first page
         vector_page = input_data.vector_data.pages[0]
         drawing_type = input_data.vision_output.drawing_type
         regions = input_data.vision_output.regions
@@ -250,54 +246,44 @@ async def filter_data(request: Request, input_data: FilterInput, debug: bool = Q
             region_texts = []
             region_symbols = []
             
-            # Always include all texts in all regions (with 15pt buffer unless specified)
+            # Always include all texts in all regions
             for text in vector_page.texts:
                 if text_in_region(text, region.coordinate_block, buffer=15 if drawing_type != "bestektekening" else 0):
                     region_texts.append(text)
             
             # Process lines based on drawing_type
             for line in vector_page.lines:
-                # Add orientation (mandatory for all lines)
                 orientation = calculate_orientation(line.p1, line.p2, line.angle)
-                
                 include = False
                 buffer = 15 if drawing_type != "bestektekening" else 0
                 
                 if drawing_type == "plattegrond":
-                    # Include all lines in plattegrond regions
                     if line_in_region(line.p1, line.p2, region.coordinate_block, buffer=buffer):
                         include = True
                 elif drawing_type == "gevelaanzicht":
-                    # Lines > 40pt in gevel regions
                     if line.length > 40 and line_in_region(line.p1, line.p2, region.coordinate_block, buffer=buffer):
                         include = True
                 elif drawing_type == "detailtekening":
-                    # Lines > 25pt in detail regions
                     if line.length > 25 and line_in_region(line.p1, line.p2, region.coordinate_block, buffer=buffer):
                         include = True
                 elif drawing_type == "doorsnede":
-                    # Vertical lines > 30pt in doorsnede regions
                     if line.length > 30 and orientation == "vertical" and line_in_region(line.p1, line.p2, region.coordinate_block, buffer=buffer):
                         include = True
-                    # Include stair-shaped lines (simplified check for zigzag)
                     if line.is_dashed and line_in_region(line.p1, line.p2, region.coordinate_block, buffer=buffer):
                         include = True
                 elif drawing_type == "bestektekening":
-                    # Combined rules
                     if line_in_region(line.p1, line.p2, region.coordinate_block, buffer=0):
                         if "grond" in region.label.lower():
-                            include = True  # Plattegrond rules: all lines
+                            include = True
                         elif "gevel" in region.label.lower():
-                            include = line.length > 40  # Gevel rules
+                            include = line.length > 40
                         elif "doorsnede" in region.label.lower():
-                            include = line.length > 30 and orientation == "vertical"  # Doorsnede rules
+                            include = line.length > 30 and orientation == "vertical"
                 elif drawing_type == "installatietekening":
-                    # Exclude lines >1pt stroke_width unless dashed
                     if line_in_region(line.p1, line.p2, region.coordinate_block, buffer=buffer):
                         if line.stroke_width <= 1 or line.is_dashed:
                             include = True
                 elif drawing_type == "unknown":
-                    # Lines > 10pt in largest region
                     if line.length > 10 and line_in_region(line.p1, line.p2, region.coordinate_block, buffer=0):
                         include = True
                 
@@ -314,7 +300,7 @@ async def filter_data(request: Request, input_data: FilterInput, debug: bool = Q
                     )
                     region_lines.append(filtered_line)
             
-            # Include symbols in region (for installatietekening or others)
+            # Include symbols in region
             for symbol in vector_page.symbols:
                 if symbol_in_region(symbol, region.coordinate_block, buffer=15 if drawing_type != "bestektekening" else 0):
                     if drawing_type == "installatietekening":
@@ -331,7 +317,7 @@ async def filter_data(request: Request, input_data: FilterInput, debug: bool = Q
                 symbols=region_symbols
             ))
         
-        # Handle unassigned (elements not in any region)
+        # Handle unassigned elements
         for line in vector_page.lines:
             orientation = calculate_orientation(line.p1, line.p2, line.angle)
             if all(not line_in_region(line.p1, line.p2, r.coordinate_block, buffer=15 if drawing_type != "bestektekening" else 0) for r in regions):
@@ -396,15 +382,7 @@ async def filter_data(request: Request, input_data: FilterInput, debug: bool = Q
         )
         
         if debug:
-            # Simple debug addition without modifying response structure
             logger.info(f"Debug mode: raw vector data has {len(vector_page.lines)} lines, {len(vector_page.texts)} texts, {len(vector_page.symbols)} symbols")
-        
-        # Cache result
-        cache_key = f"filter:{hash(json.dumps(input_data.dict()))}"
-        try:
-            redis.setex(cache_key, 3600, json.dumps(response.dict()))  # Cache for 1 hour
-        except Exception as e:
-            logger.warning(f"Failed to cache result: {str(e)}")
         
         return response
     
