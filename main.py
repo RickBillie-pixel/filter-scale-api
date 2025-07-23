@@ -1,4 +1,3 @@
-# main.py (zonder Redis)
 import os
 import logging
 import json
@@ -7,8 +6,7 @@ from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
-from shapely.geometry import Point, LineString, Polygon, box
-from shapely.affinity import scale as shapely_scale
+from shapely.geometry import LineString, box
 import math
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -20,8 +18,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Filter API",
-    description="Filters raw vector JSON data based on drawing type and region context from a vision model",
-    version="1.0.0",
+    description="Filters vector data based on drawing type and regions, passing all texts unfiltered for scale calculation",
+    version="1.1.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -29,13 +27,13 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Replace with specific origins in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
 
-# Rate limiting (zonder Redis - gebruikt in-memory storage)
+# Rate limiting
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -143,14 +141,13 @@ class Metadata(BaseModel):
     regions_processed: int
     processing_time_seconds: float
     timestamp: str
-    config_used: Dict[str, str]
+    config_used: Dict[str, Any]
 
 class FilterOutput(BaseModel):
     filtered: FilteredData
     metadata: Metadata
     errors: List[str] = Field(default_factory=list)
 
-# Helper functions
 def calculate_orientation(p1: List[float], p2: List[float], angle: Optional[float] = None) -> str:
     if angle is not None:
         normalized_angle = abs(angle % 180)
@@ -177,15 +174,6 @@ def calculate_orientation(p1: List[float], p2: List[float], angle: Optional[floa
             else:
                 return "diagonal"
 
-def point_in_region(point: List[float], region: List[float], buffer: float = 0) -> bool:
-    x, y = point
-    x1, y1, x2, y2 = region
-    x1 -= buffer
-    y1 -= buffer
-    x2 += buffer
-    y2 += buffer
-    return x1 <= x <= x2 and y1 <= y <= y2
-
 def line_in_region(line_p1: List[float], line_p2: List[float], region: List[float], buffer: float = 0) -> bool:
     line = LineString([line_p1, line_p2])
     region_box = box(region[0] - buffer, region[1] - buffer, region[2] + buffer, region[3] + buffer)
@@ -194,12 +182,14 @@ def line_in_region(line_p1: List[float], line_p2: List[float], region: List[floa
 def text_in_region(text: VectorText, region: List[float], buffer: float = 0) -> bool:
     center_x = (text.bounding_box[0] + text.bounding_box[2]) / 2
     center_y = (text.bounding_box[1] + text.bounding_box[3]) / 2
-    return point_in_region([center_x, center_y], region, buffer)
+    return center_x >= region[0] - buffer and center_x <= region[2] + buffer and \
+           center_y >= region[1] - buffer and center_y <= region[3] + buffer
 
 def symbol_in_region(symbol: VectorSymbol, region: List[float], buffer: float = 0) -> bool:
     center_x = (symbol.bounding_box[0] + symbol.bounding_box[2]) / 2
     center_y = (symbol.bounding_box[1] + symbol.bounding_box[3]) / 2
-    return point_in_region([center_x, center_y], region, buffer)
+    return center_x >= region[0] - buffer and center_x <= region[2] + buffer and \
+           center_y >= region[1] - buffer and center_y <= region[3] + buffer
 
 def calculate_region_area(region: List[float]) -> float:
     x1, y1, x2, y2 = region
@@ -208,12 +198,11 @@ def calculate_region_area(region: List[float]) -> float:
 @app.post("/filter/")
 @limiter.limit("10/minute")
 async def filter_data(request: Request, input_data: FilterInput, debug: bool = Query(False)):
-    """Filter vector data based on drawing type and regions from vision output."""
+    """Filter vector data based on drawing type and regions, passing all texts unfiltered."""
     start_time = datetime.now()
     errors = []
     
     try:
-        # Validate input
         if not input_data.vector_data.pages:
             errors.append("No pages in vector_data")
             raise HTTPException(status_code=400, detail="No pages in vector_data")
@@ -222,22 +211,19 @@ async def filter_data(request: Request, input_data: FilterInput, debug: bool = Q
             errors.append(f"No regions provided for {input_data.vision_output.drawing_type}")
             raise HTTPException(status_code=400, detail=f"No regions provided for {input_data.vision_output.drawing_type}")
         
-        # Process first page
         vector_page = input_data.vector_data.pages[0]
         drawing_type = input_data.vision_output.drawing_type
         regions = input_data.vision_output.regions
         
         logger.info(f"Processing page {input_data.vector_data.page_number} of type {drawing_type}")
         
-        # Count original elements
         original_count = len(vector_page.lines) + len(vector_page.texts) + len(vector_page.symbols)
         
         filtered_regions = []
         unassigned_lines = []
-        unassigned_texts = []
-        unassigned_symbols = []
+        unassigned_texts = vector_page.texts  # Start with all texts as unassigned
+        unassigned_symbols = vector_page.symbols
         
-        # For "unknown" drawing type, select largest region if available
         if drawing_type == "unknown" and regions:
             regions = [max(regions, key=lambda r: calculate_region_area(r.coordinate_block))]
         
@@ -246,12 +232,14 @@ async def filter_data(request: Request, input_data: FilterInput, debug: bool = Q
             region_texts = []
             region_symbols = []
             
-            # Always include all texts in all regions
+            # Include all texts in region
             for text in vector_page.texts:
                 if text_in_region(text, region.coordinate_block, buffer=15 if drawing_type != "bestektekening" else 0):
                     region_texts.append(text)
+                    if text in unassigned_texts:
+                        unassigned_texts.remove(text)
             
-            # Process lines based on drawing_type
+            # Filter lines based on drawing_type
             for line in vector_page.lines:
                 orientation = calculate_orientation(line.p1, line.p2, line.angle)
                 include = False
@@ -300,14 +288,12 @@ async def filter_data(request: Request, input_data: FilterInput, debug: bool = Q
                     )
                     region_lines.append(filtered_line)
             
-            # Include symbols in region
+            # Include all symbols in region (unfiltered)
             for symbol in vector_page.symbols:
                 if symbol_in_region(symbol, region.coordinate_block, buffer=15 if drawing_type != "bestektekening" else 0):
-                    if drawing_type == "installatietekening":
-                        if symbol.type.lower() in ["circle", "arrow", "zigzag"]:
-                            region_symbols.append(symbol)
-                    else:
-                        region_symbols.append(symbol)
+                    region_symbols.append(symbol)
+                    if symbol in unassigned_symbols:
+                        unassigned_symbols.remove(symbol)
             
             filtered_regions.append(FilteredRegion(
                 label=region.label,
@@ -317,7 +303,7 @@ async def filter_data(request: Request, input_data: FilterInput, debug: bool = Q
                 symbols=region_symbols
             ))
         
-        # Handle unassigned elements
+        # Handle unassigned lines
         for line in vector_page.lines:
             orientation = calculate_orientation(line.p1, line.p2, line.angle)
             if all(not line_in_region(line.p1, line.p2, r.coordinate_block, buffer=15 if drawing_type != "bestektekening" else 0) for r in regions):
@@ -333,14 +319,6 @@ async def filter_data(request: Request, input_data: FilterInput, debug: bool = Q
                 )
                 unassigned_lines.append(filtered_line)
         
-        for text in vector_page.texts:
-            if all(not text_in_region(text, r.coordinate_block, buffer=15 if drawing_type != "bestektekening" else 0) for r in regions):
-                unassigned_texts.append(text)
-        
-        for symbol in vector_page.symbols:
-            if all(not symbol_in_region(symbol, r.coordinate_block, buffer=15 if drawing_type != "bestektekening" else 0) for r in regions):
-                unassigned_symbols.append(symbol)
-        
         filtered_data = FilteredData(
             page_number=input_data.vector_data.page_number,
             drawing_type=drawing_type,
@@ -353,13 +331,11 @@ async def filter_data(request: Request, input_data: FilterInput, debug: bool = Q
             )
         )
         
-        # Count filtered elements
         filtered_count = sum(
             len(r.lines) + len(r.texts) + len(r.symbols)
             for r in filtered_regions
         ) + len(unassigned_lines) + len(unassigned_texts) + len(unassigned_symbols)
         
-        # Calculate processing time
         processing_time = (datetime.now() - start_time).total_seconds()
         
         metadata = Metadata(
@@ -369,7 +345,9 @@ async def filter_data(request: Request, input_data: FilterInput, debug: bool = Q
             processing_time_seconds=processing_time,
             timestamp=datetime.now().isoformat(),
             config_used={
-                "scale_api_version": input_data.vision_output.scale_api_version
+                "scale_api_version": input_data.vision_output.scale_api_version,
+                "drawing_type": drawing_type,
+                "filter_mode": "lines_only"
             }
         )
         
@@ -401,8 +379,15 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "Filter API",
-        "version": "1.0.0",
-        "timestamp": datetime.now().isoformat()
+        "version": "1.1.0",
+        "timestamp": datetime.now().isoformat(),
+        "features": [
+            "Filters lines based on drawing type and regions",
+            "Passes all texts unfiltered for scale calculation",
+            "Supports optional symbols (unfiltered)",
+            "Region-based filtering using vision output",
+            "Shapely-based geometric checks"
+        ]
     }
 
 if __name__ == "__main__":
