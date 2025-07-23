@@ -30,7 +30,7 @@ app = FastAPI(
 # CORS middleware (restricted for security)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Replace with specific origins in production, e.g., ["https://your-app.com"]
+    allow_origins=["*"],  # Replace with specific origins in production
     allow_credentials=True,
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
@@ -105,7 +105,7 @@ class ImageMetadata(BaseModel):
 class VisionOutput(BaseModel):
     drawing_type: str = Field(..., pattern="^(plattegrond|gevelaanzicht|detailtekening|doorsnede|bestektekening|installatietekening|unknown)$")
     scale_api_version: str = Field(..., min_length=1)
-    regions: List[VisionRegion] = Field(..., min_items=1)
+    regions: List[VisionRegion] = Field(..., min_items=0)  # Allow empty regions for specific cases
     image_metadata: ImageMetadata
 
 class FilterInput(BaseModel):
@@ -209,34 +209,10 @@ def calculate_region_area(region: List[float]) -> float:
     x1, y1, x2, y2 = region
     return abs((x2 - x1) * (y2 - y1))
 
-def calculate_line_orientation(p1: List[float], p2: List[float], angle: Optional[float] = None) -> str:
-    """Calculate line orientation based on points or angle."""
-    if angle is not None:
-        normalized_angle = abs(angle % 180)
-        if normalized_angle < 10 or normalized_angle > 170:
-            return "horizontal"
-        elif 80 < normalized_angle < 100:
-            return "vertical"
-        else:
-            return "diagonal"
-    else:
-        dx = abs(p2[0] - p1[0])
-        dy = abs(p2[1] - p1[1])
-        if dx == 0:
-            return "vertical"
-        elif dy == 0:
-            return "horizontal"
-        else:
-            angle_rad = math.atan2(dy, dx)
-            angle_deg = math.degrees(angle_rad)
-            if angle_deg < 10 or angle_deg > 170:
-                return "horizontal"
-            elif 80 < angle_deg < 100:
-                return "vertical"
-            else:
-                return "diagonal"
-
-def process_filter(input_data: FilterInput, debug: bool = False) -> FilterOutput:
+@app.post("/filter/")
+@limiter.limit("10/minute")
+async def filter_data(input_data: FilterInput, debug: bool = Query(False)):
+    """Filter vector data based on drawing type and regions from vision output."""
     start_time = datetime.now()
     errors = []
     
@@ -246,9 +222,9 @@ def process_filter(input_data: FilterInput, debug: bool = False) -> FilterOutput
             errors.append("No pages in vector_data")
             raise HTTPException(status_code=400, detail="No pages in vector_data")
         
-        if not input_data.vision_output.regions:
-            errors.append("No regions in vision_output")
-            raise HTTPException(status_code=400, detail="No regions in vision_output")
+        if input_data.vision_output.drawing_type in ["detailtekening", "unknown"] and not input_data.vision_output.regions:
+            errors.append(f"No regions provided for {input_data.vision_output.drawing_type}")
+            raise HTTPException(status_code=400, detail=f"No regions provided for {input_data.vision_output.drawing_type}")
         
         # Process first page (extend for multi-page if needed)
         vector_page = input_data.vector_data.pages[0]
@@ -265,38 +241,46 @@ def process_filter(input_data: FilterInput, debug: bool = False) -> FilterOutput
         unassigned_texts = []
         unassigned_symbols = []
         
+        # For "unknown" drawing type, select largest region if available
+        if drawing_type == "unknown" and regions:
+            regions = [max(regions, key=lambda r: calculate_region_area(r.coordinate_block))]
+        
         for region in regions:
             region_lines = []
             region_texts = []
             region_symbols = []
             
-            # Always include all texts in all regions
+            # Always include all texts in all regions (with 15pt buffer unless specified)
             for text in vector_page.texts:
-                if text_in_region(text, region.coordinate_block, buffer=15):
+                if text_in_region(text, region.coordinate_block, buffer=15 if drawing_type != "bestektekening" else 0):
                     region_texts.append(text)
             
             # Process lines based on drawing_type
             for line in vector_page.lines:
                 # Add orientation (mandatory for all lines)
-                orientation = calculate_line_orientation(line.p1, line.p2, line.angle)
+                orientation = calculate_orientation(line.p1, line.p2, line.angle)
                 
                 include = False
+                buffer = 15 if drawing_type != "bestektekening" else 0
                 
                 if drawing_type == "plattegrond":
                     # Include all lines in plattegrond regions
-                    if line_in_region(line.p1, line.p2, region.coordinate_block, buffer=15):
+                    if line_in_region(line.p1, line.p2, region.coordinate_block, buffer=buffer):
                         include = True
                 elif drawing_type == "gevelaanzicht":
                     # Lines > 40pt in gevel regions
-                    if line.length > 40 and line_in_region(line.p1, line.p2, region.coordinate_block, buffer=15):
+                    if line.length > 40 and line_in_region(line.p1, line.p2, region.coordinate_block, buffer=buffer):
                         include = True
                 elif drawing_type == "detailtekening":
                     # Lines > 25pt in detail regions
-                    if line.length > 25 and line_in_region(line.p1, line.p2, region.coordinate_block, buffer=15):
+                    if line.length > 25 and line_in_region(line.p1, line.p2, region.coordinate_block, buffer=buffer):
                         include = True
                 elif drawing_type == "doorsnede":
                     # Vertical lines > 30pt in doorsnede regions
-                    if line.length > 30 and orientation == "vertical" and line_in_region(line.p1, line.p2, region.coordinate_block, buffer=15):
+                    if line.length > 30 and orientation == "vertical" and line_in_region(line.p1, line.p2, region.coordinate_block, buffer=buffer):
+                        include = True
+                    # Include stair-shaped lines (simplified check for zigzag)
+                    if line.is_dashed and line_in_region(line.p1, line.p2, region.coordinate_block, buffer=buffer):
                         include = True
                 elif drawing_type == "bestektekening":
                     # Combined rules
@@ -309,7 +293,7 @@ def process_filter(input_data: FilterInput, debug: bool = False) -> FilterOutput
                             include = line.length > 30 and orientation == "vertical"  # Doorsnede rules
                 elif drawing_type == "installatietekening":
                     # Exclude lines >1pt stroke_width unless dashed
-                    if line_in_region(line.p1, line.p2, region.coordinate_block, buffer=15):
+                    if line_in_region(line.p1, line.p2, region.coordinate_block, buffer=buffer):
                         if line.stroke_width <= 1 or line.is_dashed:
                             include = True
                 elif drawing_type == "unknown":
@@ -330,10 +314,14 @@ def process_filter(input_data: FilterInput, debug: bool = False) -> FilterOutput
                     )
                     region_lines.append(filtered_line)
             
-            # Include symbols in region
+            # Include symbols in region (for installatietekening or others)
             for symbol in vector_page.symbols:
-                if symbol_in_region(symbol, region.coordinate_block, buffer=15):
-                    region_symbols.append(symbol)
+                if symbol_in_region(symbol, region.coordinate_block, buffer=15 if drawing_type != "bestektekening" else 0):
+                    if drawing_type == "installatietekening":
+                        if symbol.type.lower() in ["circle", "arrow", "zigzag"]:
+                            region_symbols.append(symbol)
+                    else:
+                        region_symbols.append(symbol)
             
             filtered_regions.append(FilteredRegion(
                 label=region.label,
@@ -345,8 +333,8 @@ def process_filter(input_data: FilterInput, debug: bool = False) -> FilterOutput
         
         # Handle unassigned (elements not in any region)
         for line in vector_page.lines:
-            if all(not line_in_region(line.p1, line.p2, r.coordinate_block, buffer=15) for r in regions):
-                orientation = calculate_line_orientation(line.p1, line.p2, line.angle)
+            orientation = calculate_orientation(line.p1, line.p2, line.angle)
+            if all(not line_in_region(line.p1, line.p2, r.coordinate_block, buffer=15 if drawing_type != "bestektekening" else 0) for r in regions):
                 filtered_line = FilteredLine(
                     p1=line.p1,
                     p2=line.p2,
@@ -360,11 +348,11 @@ def process_filter(input_data: FilterInput, debug: bool = False) -> FilterOutput
                 unassigned_lines.append(filtered_line)
         
         for text in vector_page.texts:
-            if all(not text_in_region(text, r.coordinate_block, buffer=15) for r in regions):
+            if all(not text_in_region(text, r.coordinate_block, buffer=15 if drawing_type != "bestektekening" else 0) for r in regions):
                 unassigned_texts.append(text)
         
         for symbol in vector_page.symbols:
-            if all(not symbol_in_region(symbol, r.coordinate_block, buffer=15) for r in regions):
+            if all(not symbol_in_region(symbol, r.coordinate_block, buffer=15 if drawing_type != "bestektekening" else 0) for r in regions):
                 unassigned_symbols.append(symbol)
         
         filtered_data = FilteredData(
@@ -408,44 +396,25 @@ def process_filter(input_data: FilterInput, debug: bool = False) -> FilterOutput
         )
         
         if debug:
-            response.dict()["debug"] = {"raw_vector_data": vector_page.dict()}
+            response.filtered["debug"] = {"raw_vector_data": vector_page.dict()}
+        
+        # Cache result
+        cache_key = f"filter:{hash(json.dumps(input_data.dict()))}"
+        try:
+            redis.setex(cache_key, 3600, json.dumps(response.dict()))  # Cache for 1 hour
+        except Exception as e:
+            logger.warning(f"Failed to cache result: {str(e)}")
         
         return response
     
+    except HTTPException as e:
+        raise e
     except ValueError as e:
         logger.error(f"Validation error: {str(e)}")
-        return FilterOutput(
-            filtered=FilteredData(
-                page_number=1,
-                drawing_type="unknown",
-                scale_api_version="",
-                regions=[],
-                unassigned=UnassignedElements(lines=[], texts=[], symbols=[])
-            ),
-            metadata=Metadata(
-                processed_elements=0,
-                filtered_elements=0,
-                regions_processed=0,
-                processing_time_seconds=0,
-                timestamp=datetime.now().isoformat(),
-                config_used={}
-            ),
-            errors=[str(e)]
-        )
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-@app.post("/filter", response_model=FilterOutput)
-@limiter.limit("100/minute")
-async def filter_data(input_data: FilterInput, debug: bool = Query(False)):
-    """
-    Filter vector data based on drawing type and regions.
-    
-    - **input_data**: Combined vector data and vision output
-    - **debug**: Include debug information in response
-    """
-    return process_filter(input_data, debug)
 
 @app.get("/health")
 async def health_check():
@@ -459,7 +428,5 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    import os
-    
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
