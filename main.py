@@ -136,7 +136,7 @@ def line_intersects_region(line_p1: List[float], line_p2: List[float], region: L
         if x1 <= x <= x2 and y1 <= y <= y2:
             return True
     
-    # Method 2: Check if line crosses region boundaries
+    # Method 2: Check if line completely spans the region in x or y direction
     line_x1, line_y1 = line_p1
     line_x2, line_y2 = line_p2
     
@@ -172,7 +172,7 @@ def should_include_line(line: VectorLine, drawing_type: str, region_label: str) 
     orientation = calculate_orientation(line.p1, line.p2, line.angle)
     
     if drawing_type == "plattegrond":
-        return line.length > 50  # Plattegrond: lines > 50pt
+        return line.length > 50  # ✅ CORRECT: Plattegrond lines > 50pt
     elif drawing_type == "gevelaanzicht":
         return line.length > 40  # Gevelaanzicht: lines > 40pt
     elif drawing_type == "detailtekening":
@@ -435,18 +435,18 @@ async def root():
                     "label": "region name",
                     "lines": [
                         {
-                            "p1": {"x": float, "y": float},
-                            "p2": {"x": float, "y": float},
-                            "length": float,
+                            "p1": {"x": "float", "y": "float"},
+                            "p2": {"x": "float", "y": "float"},
+                            "length": "float",
                             "orientation": "horizontal|vertical|diagonal",
-                            "midpoint": {"x": float, "y": float}
+                            "midpoint": {"x": "float", "y": "float"}
                         }
                     ],
                     "texts": [
                         {
                             "text": "string",
-                            "position": {"x": float, "y": float},
-                            "bounding_box": [x1, y1, x2, y2]
+                            "position": {"x": "float", "y": "float"},
+                            "bounding_box": "[x1, y1, x2, y2]"
                         }
                     ]
                 }
