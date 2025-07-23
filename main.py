@@ -128,18 +128,36 @@ def calculate_midpoint(p1: List[float], p2: List[float]) -> CleanPoint:
     )
 
 def line_intersects_region(line_p1: List[float], line_p2: List[float], region: List[float]) -> bool:
-    """Check if line intersects with region (no buffer for precision)"""
+    """Check if line intersects with region - improved with debugging and multiple methods"""
+    x1, y1, x2, y2 = region
+    
+    # Method 1: Check if any endpoint is in region
+    for x, y in [line_p1, line_p2]:
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            return True
+    
+    # Method 2: Check if line crosses region boundaries
+    line_x1, line_y1 = line_p1
+    line_x2, line_y2 = line_p2
+    
+    # Check if line completely spans the region in x or y direction
+    if ((line_x1 <= x1 and line_x2 >= x2) or (line_x1 >= x2 and line_x2 <= x1)) and \
+       ((min(line_y1, line_y2) <= y2) and (max(line_y1, line_y2) >= y1)):
+        return True
+        
+    if ((line_y1 <= y1 and line_y2 >= y2) or (line_y1 >= y2 and line_y2 <= y1)) and \
+       ((min(line_x1, line_x2) <= x2) and (max(line_x1, line_x2) >= x1)):
+        return True
+    
+    # Method 3: Use Shapely as fallback (with error handling)
     try:
         line = LineString([line_p1, line_p2])
-        region_box = box(region[0], region[1], region[2], region[3])
+        region_box = box(x1, y1, x2, y2)
         return line.intersects(region_box)
-    except Exception:
-        # Fallback: check if any endpoint is in region
-        x1, y1, x2, y2 = region
-        for x, y in [line_p1, line_p2]:
-            if x1 <= x <= x2 and y1 <= y <= y2:
-                return True
-        return False
+    except Exception as e:
+        logger.warning(f"Shapely intersection failed: {e}")
+        
+    return False
 
 def text_in_region(text: VectorText, region: List[float]) -> bool:
     """Check if text center is in region"""
@@ -180,7 +198,7 @@ def should_include_line(line: VectorLine, drawing_type: str, region_label: str) 
         return line.length > 10
 
 @app.post("/filter/", response_model=CleanOutput)
-async def filter_clean(input_data: FilterInput):
+async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
     """Filter data and return clean, focused output per region"""
     
     try:
@@ -195,20 +213,41 @@ async def filter_clean(input_data: FilterInput):
         logger.info(f"Processing {drawing_type} with {len(regions)} regions")
         logger.info(f"Input: {len(vector_page.lines)} lines, {len(vector_page.texts)} texts")
         
+        # Log first few lines for debugging
+        if debug and vector_page.lines:
+            logger.info("Sample lines:")
+            for i, line in enumerate(vector_page.lines[:3]):
+                logger.info(f"  Line {i}: p1={line.p1}, p2={line.p2}, length={line.length}")
+        
         region_outputs = []
+        total_lines_processed = 0
         
         for region in regions:
             region_lines = []
             region_texts = []
+            lines_in_region = 0
             
             logger.info(f"Processing region: {region.label}")
+            logger.info(f"  Region bounds: {region.coordinate_block}")
             
             # Process lines for this region
-            for line in vector_page.lines:
+            for i, line in enumerate(vector_page.lines):
                 # Check if line is in region
-                if line_intersects_region(line.p1, line.p2, region.coordinate_block):
+                is_in_region = line_intersects_region(line.p1, line.p2, region.coordinate_block)
+                
+                if debug and i < 5:  # Debug first 5 lines
+                    logger.info(f"  Line {i}: {line.p1} -> {line.p2}, in_region: {is_in_region}")
+                
+                if is_in_region:
+                    lines_in_region += 1
+                    
                     # Check if line should be included based on rules
-                    if should_include_line(line, drawing_type, region.label):
+                    should_include = should_include_line(line, drawing_type, region.label)
+                    
+                    if debug and lines_in_region <= 3:
+                        logger.info(f"    Should include: {should_include} (type: {drawing_type}, length: {line.length})")
+                    
+                    if should_include:
                         clean_line = CleanLine(
                             p1=CleanPoint(x=round(line.p1[0], 1), y=round(line.p1[1], 1)),
                             p2=CleanPoint(x=round(line.p2[0], 1), y=round(line.p2[1], 1)),
@@ -217,6 +256,8 @@ async def filter_clean(input_data: FilterInput):
                             midpoint=calculate_midpoint(line.p1, line.p2)
                         )
                         region_lines.append(clean_line)
+            
+            total_lines_processed += lines_in_region
             
             # Process texts for this region
             for text in vector_page.texts:
@@ -236,7 +277,7 @@ async def filter_clean(input_data: FilterInput):
             )
             region_outputs.append(region_data)
             
-            logger.info(f"  {region.label}: {len(region_lines)} lines, {len(region_texts)} texts")
+            logger.info(f"  {region.label}: {len(region_lines)} lines (from {lines_in_region} in region), {len(region_texts)} texts")
         
         # Create clean output - NO unassigned data, NO metadata
         output = CleanOutput(
@@ -248,8 +289,17 @@ async def filter_clean(input_data: FilterInput):
         total_texts = sum(len(r.texts) for r in region_outputs)
         
         logger.info(f"✅ Clean filtering completed:")
-        logger.info(f"  Total output: {total_lines} lines, {total_texts} texts")
+        logger.info(f"  Total lines found in regions: {total_lines_processed}")
+        logger.info(f"  Total lines included: {total_lines}")
+        logger.info(f"  Total texts: {total_texts}")
         logger.info(f"  Regions: {len(region_outputs)}")
+        
+        if total_lines == 0:
+            logger.warning("⚠️  NO LINES FOUND! This suggests a coordinate system or intersection problem.")
+            logger.warning(f"Sample region bounds: {regions[0].coordinate_block if regions else 'None'}")
+            if vector_page.lines:
+                sample_line = vector_page.lines[0]
+                logger.warning(f"Sample line: {sample_line.p1} -> {sample_line.p2}")
         
         return output
     
@@ -258,6 +308,89 @@ async def filter_clean(input_data: FilterInput):
     except Exception as e:
         logger.error(f"Error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.post("/debug/", response_model=Dict[str, Any])
+async def debug_filter(input_data: FilterInput):
+    """Debug endpoint to diagnose line filtering issues"""
+    
+    try:
+        vector_page = input_data.vector_data.pages[0]
+        regions = input_data.vision_output.regions
+        
+        debug_info = {
+            "total_lines": len(vector_page.lines),
+            "total_texts": len(vector_page.texts),
+            "drawing_type": input_data.vision_output.drawing_type,
+            "regions": [],
+            "sample_lines": [],
+            "coordinate_analysis": {}
+        }
+        
+        # Sample first 5 lines
+        for i, line in enumerate(vector_page.lines[:5]):
+            debug_info["sample_lines"].append({
+                "index": i,
+                "p1": line.p1,
+                "p2": line.p2,
+                "length": line.length,
+                "stroke_width": line.stroke_width
+            })
+        
+        # Analyze coordinate ranges
+        if vector_page.lines:
+            all_x = []
+            all_y = []
+            for line in vector_page.lines:
+                all_x.extend([line.p1[0], line.p2[0]])
+                all_y.extend([line.p1[1], line.p2[1]])
+            
+            debug_info["coordinate_analysis"] = {
+                "x_range": [min(all_x), max(all_x)],
+                "y_range": [min(all_y), max(all_y)],
+                "total_points": len(all_x)
+            }
+        
+        # Test each region
+        for region in regions:
+            region_debug = {
+                "label": region.label,
+                "bounds": region.coordinate_block,
+                "lines_in_region": 0,
+                "lines_included": 0,
+                "texts_in_region": 0,
+                "sample_intersections": []
+            }
+            
+            # Test line intersections
+            for i, line in enumerate(vector_page.lines[:10]):  # First 10 lines
+                is_in_region = line_intersects_region(line.p1, line.p2, region.coordinate_block)
+                if is_in_region:
+                    region_debug["lines_in_region"] += 1
+                    should_include = should_include_line(line, input_data.vision_output.drawing_type, region.label)
+                    if should_include:
+                        region_debug["lines_included"] += 1
+                
+                if i < 5:  # Sample first 5
+                    region_debug["sample_intersections"].append({
+                        "line_index": i,
+                        "p1": line.p1,
+                        "p2": line.p2,
+                        "in_region": is_in_region,
+                        "would_include": should_include_line(line, input_data.vision_output.drawing_type, region.label) if is_in_region else False
+                    })
+            
+            # Count texts in region
+            for text in vector_page.texts:
+                if text_in_region(text, region.coordinate_block):
+                    region_debug["texts_in_region"] += 1
+            
+            debug_info["regions"].append(region_debug)
+        
+        return debug_info
+    
+    except Exception as e:
+        logger.error(f"Debug error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Debug error: {str(e)}")
 
 @app.get("/health")
 async def health_check():
@@ -281,8 +414,14 @@ async def root():
             "No unnecessary metadata",
             "Precise line filtering with orientation and midpoint",
             "Text with bounding box preserved",
-            "Plattegrond includes ALL lines regardless of length"
+            "Plattegrond includes ALL lines regardless of length",
+            "Debug endpoint for troubleshooting"
         ],
+        "endpoints": {
+            "/filter/": "Main filtering endpoint",
+            "/debug/": "Debug line intersection issues",
+            "/filter/?debug=true": "Filter with debug logging"
+        },
         "output_structure": {
             "drawing_type": "string",
             "regions": [
