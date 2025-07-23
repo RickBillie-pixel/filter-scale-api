@@ -169,33 +169,30 @@ def text_in_region(text: VectorText, region: List[float]) -> bool:
 def should_include_line(line: VectorLine, drawing_type: str, region_label: str) -> bool:
     """Determine if line should be included based on drawing type and region"""
     
-    # For plattegrond: include ALL lines regardless of length
-    if drawing_type == "plattegrond":
-        return True
-    
-    # For other drawing types, apply length filters
     orientation = calculate_orientation(line.p1, line.p2, line.angle)
     
-    if drawing_type == "gevelaanzicht":
-        return line.length > 40
+    if drawing_type == "plattegrond":
+        return line.length > 50  # Plattegrond: lines > 50pt
+    elif drawing_type == "gevelaanzicht":
+        return line.length > 40  # Gevelaanzicht: lines > 40pt
     elif drawing_type == "detailtekening":
-        return line.length > 25
+        return line.length > 25  # Detailtekening: lines > 25pt
     elif drawing_type == "doorsnede":
-        return (line.length > 30 and orientation == "vertical") or line.is_dashed
+        return (line.length > 30 and orientation == "vertical") or line.is_dashed  # Doorsnede: vertical > 30pt OR dashed
     elif drawing_type == "bestektekening":
         label_lower = region_label.lower()
         if "grond" in label_lower or "verdieping" in label_lower:
-            return True  # Plattegrond rules: all lines
+            return line.length > 50  # Plattegrond rules: lines > 50pt
         elif "gevel" in label_lower:
-            return line.length > 40
+            return line.length > 40  # Gevel rules: lines > 40pt
         elif "doorsnede" in label_lower:
-            return line.length > 30 and orientation == "vertical"
+            return line.length > 30 and orientation == "vertical"  # Doorsnede rules: vertical > 30pt
         else:
-            return True  # Default: all lines
+            return line.length > 25  # Default: lines > 25pt
     elif drawing_type == "installatietekening":
-        return line.stroke_width <= 1 or line.is_dashed
+        return line.stroke_width <= 1 or line.is_dashed  # Installatie: thin lines OR dashed
     else:  # unknown
-        return line.length > 10
+        return line.length > 10  # Unknown: lines > 10pt
 
 @app.post("/filter/", response_model=CleanOutput)
 async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
@@ -410,13 +407,22 @@ async def root():
         "description": "Returns clean, focused output per region - only essential data",
         "features": [
             "Clean output per region only",
-            "No unassigned data",
+            "No unassigned data", 
             "No unnecessary metadata",
             "Precise line filtering with orientation and midpoint",
             "Text with bounding box preserved",
-            "Plattegrond includes ALL lines regardless of length",
+            "Correct length filtering per drawing type",
             "Debug endpoint for troubleshooting"
         ],
+        "drawing_types": {
+            "plattegrond": "Lines > 50pt",
+            "gevelaanzicht": "Lines > 40pt",
+            "detailtekening": "Lines > 25pt", 
+            "doorsnede": "Vertical lines > 30pt OR dashed lines",
+            "bestektekening": "Region-specific rules (grond>50pt, gevel>40pt, doorsnede=vertical>30pt, default>25pt)",
+            "installatietekening": "Lines ≤ 1pt stroke OR dashed",
+            "unknown": "Lines > 10pt"
+        },
         "endpoints": {
             "/filter/": "Main filtering endpoint",
             "/debug/": "Debug line intersection issues",
