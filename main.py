@@ -7,8 +7,7 @@ from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
-from shapely.geometry import Point, LineString, Polygon
-from shapely.geometry.box import box
+from shapely.geometry import Point, LineString, Polygon, box
 from shapely.affinity import scale as shapely_scale
 import math
 from redis import Redis
@@ -210,6 +209,33 @@ def calculate_region_area(region: List[float]) -> float:
     x1, y1, x2, y2 = region
     return abs((x2 - x1) * (y2 - y1))
 
+def calculate_line_orientation(p1: List[float], p2: List[float], angle: Optional[float] = None) -> str:
+    """Calculate line orientation based on points or angle."""
+    if angle is not None:
+        normalized_angle = abs(angle % 180)
+        if normalized_angle < 10 or normalized_angle > 170:
+            return "horizontal"
+        elif 80 < normalized_angle < 100:
+            return "vertical"
+        else:
+            return "diagonal"
+    else:
+        dx = abs(p2[0] - p1[0])
+        dy = abs(p2[1] - p1[1])
+        if dx == 0:
+            return "vertical"
+        elif dy == 0:
+            return "horizontal"
+        else:
+            angle_rad = math.atan2(dy, dx)
+            angle_deg = math.degrees(angle_rad)
+            if angle_deg < 10 or angle_deg > 170:
+                return "horizontal"
+            elif 80 < angle_deg < 100:
+                return "vertical"
+            else:
+                return "diagonal"
+
 def process_filter(input_data: FilterInput, debug: bool = False) -> FilterOutput:
     start_time = datetime.now()
     errors = []
@@ -252,7 +278,7 @@ def process_filter(input_data: FilterInput, debug: bool = False) -> FilterOutput
             # Process lines based on drawing_type
             for line in vector_page.lines:
                 # Add orientation (mandatory for all lines)
-                line.orientation = calculate_line_orientation(line.p1, line.p2, line.angle)
+                orientation = calculate_line_orientation(line.p1, line.p2, line.angle)
                 
                 include = False
                 
@@ -270,7 +296,7 @@ def process_filter(input_data: FilterInput, debug: bool = False) -> FilterOutput
                         include = True
                 elif drawing_type == "doorsnede":
                     # Vertical lines > 30pt in doorsnede regions
-                    if line.length > 30 and line.orientation == "vertical" and line_in_region(line.p1, line.p2, region.coordinate_block, buffer=15):
+                    if line.length > 30 and orientation == "vertical" and line_in_region(line.p1, line.p2, region.coordinate_block, buffer=15):
                         include = True
                 elif drawing_type == "bestektekening":
                     # Combined rules
@@ -280,7 +306,7 @@ def process_filter(input_data: FilterInput, debug: bool = False) -> FilterOutput
                         elif "gevel" in region.label.lower():
                             include = line.length > 40  # Gevel rules
                         elif "doorsnede" in region.label.lower():
-                            include = line.length > 30 and line.orientation == "vertical"  # Doorsnede rules
+                            include = line.length > 30 and orientation == "vertical"  # Doorsnede rules
                 elif drawing_type == "installatietekening":
                     # Exclude lines >1pt stroke_width unless dashed
                     if line_in_region(line.p1, line.p2, region.coordinate_block, buffer=15):
@@ -300,7 +326,7 @@ def process_filter(input_data: FilterInput, debug: bool = False) -> FilterOutput
                         color=line.color,
                         is_dashed=line.is_dashed,
                         angle=line.angle,
-                        orientation=line.orientation
+                        orientation=orientation
                     )
                     region_lines.append(filtered_line)
             
@@ -320,7 +346,7 @@ def process_filter(input_data: FilterInput, debug: bool = False) -> FilterOutput
         # Handle unassigned (elements not in any region)
         for line in vector_page.lines:
             if all(not line_in_region(line.p1, line.p2, r.coordinate_block, buffer=15) for r in regions):
-                line.orientation = calculate_line_orientation(line.p1, line.p2, line.angle)
+                orientation = calculate_line_orientation(line.p1, line.p2, line.angle)
                 filtered_line = FilteredLine(
                     p1=line.p1,
                     p2=line.p2,
@@ -329,7 +355,7 @@ def process_filter(input_data: FilterInput, debug: bool = False) -> FilterOutput
                     color=line.color,
                     is_dashed=line.is_dashed,
                     angle=line.angle,
-                    orientation=line.orientation
+                    orientation=orientation
                 )
                 unassigned_lines.append(filtered_line)
         
@@ -382,14 +408,20 @@ def process_filter(input_data: FilterInput, debug: bool = False) -> FilterOutput
         )
         
         if debug:
-            response["debug"] = {"raw_vector_data": vector_page.dict()}
+            response.dict()["debug"] = {"raw_vector_data": vector_page.dict()}
         
         return response
     
     except ValueError as e:
         logger.error(f"Validation error: {str(e)}")
         return FilterOutput(
-            filtered=None,
+            filtered=FilteredData(
+                page_number=1,
+                drawing_type="unknown",
+                scale_api_version="",
+                regions=[],
+                unassigned=UnassignedElements(lines=[], texts=[], symbols=[])
+            ),
             metadata=Metadata(
                 processed_elements=0,
                 filtered_elements=0,
@@ -403,6 +435,17 @@ def process_filter(input_data: FilterInput, debug: bool = False) -> FilterOutput
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.post("/filter", response_model=FilterOutput)
+@limiter.limit("100/minute")
+async def filter_data(input_data: FilterInput, debug: bool = Query(False)):
+    """
+    Filter vector data based on drawing type and regions.
+    
+    - **input_data**: Combined vector data and vision output
+    - **debug**: Include debug information in response
+    """
+    return process_filter(input_data, debug)
 
 @app.get("/health")
 async def health_check():
