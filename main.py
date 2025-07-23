@@ -4,7 +4,7 @@ import logging
 import json
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from shapely.geometry import Point, LineString, Polygon, box
@@ -211,7 +211,7 @@ def calculate_region_area(region: List[float]) -> float:
 
 @app.post("/filter/")
 @limiter.limit("10/minute")
-async def filter_data(input_data: FilterInput, debug: bool = Query(False)):
+async def filter_data(request: Request, input_data: FilterInput, debug: bool = Query(False)):
     """Filter vector data based on drawing type and regions from vision output."""
     start_time = datetime.now()
     errors = []
@@ -396,7 +396,8 @@ async def filter_data(input_data: FilterInput, debug: bool = Query(False)):
         )
         
         if debug:
-            response.filtered["debug"] = {"raw_vector_data": vector_page.dict()}
+            # Simple debug addition without modifying response structure
+            logger.info(f"Debug mode: raw vector data has {len(vector_page.lines)} lines, {len(vector_page.texts)} texts, {len(vector_page.symbols)} symbols")
         
         # Cache result
         cache_key = f"filter:{hash(json.dumps(input_data.dict()))}"
