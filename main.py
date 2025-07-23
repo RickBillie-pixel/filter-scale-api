@@ -5,23 +5,18 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
 from shapely.geometry import LineString, box
 import math
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Filter API",
-    description="Filters lines per region based on drawing type, passing all texts with original coordinates unfiltered",
-    version="2.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
+    title="Clean Filter API",
+    description="Returns clean, focused output per region - only essential data",
+    version="3.0.0"
 )
 
 # CORS middleware
@@ -33,276 +28,285 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Rate limiting
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
+# Input Models
 class VectorLine(BaseModel):
-    p1: List[float] = Field(..., min_items=2, max_items=2)
-    p2: List[float] = Field(..., min_items=2, max_items=2)
-    stroke_width: float = Field(..., ge=0.0)
-    length: float = Field(..., ge=0.0)
-    color: List[int] = Field(..., min_items=3, max_items=3)
-    is_dashed: bool = Field(default=False)
-    angle: Optional[float] = Field(default=None, ge=0.0, le=360.0)
+    p1: List[float]
+    p2: List[float] 
+    stroke_width: float
+    length: float
+    color: List[int]
+    is_dashed: bool = False
+    angle: Optional[float] = None
 
 class VectorText(BaseModel):
-    text: str = Field(..., min_length=1)
-    position: List[float] = Field(..., min_items=2, max_items=2)
-    bounding_box: List[float] = Field(..., min_items=4, max_items=4)
-
-    @validator('bounding_box')
-    def validate_bbox(cls, v):
-        if v[0] >= v[2] or v[1] >= v[3]:
-            raise ValueError('Invalid bounding box: x0 < x1 and y0 < y1 required')
-        return v
+    text: str
+    position: List[float]
+    font_size: Optional[float] = None
+    bounding_box: List[float]
 
 class VectorPage(BaseModel):
-    page_size: Dict[str, float] = Field(..., example={"width": 3370.0, "height": 2384.0})
-    lines: List[VectorLine] = Field(default_factory=list)
-    texts: List[VectorText] = Field(default_factory=list)
+    page_size: Dict[str, float]
+    lines: List[VectorLine]
+    texts: List[VectorText]
 
 class VectorData(BaseModel):
-    page_number: int = Field(..., ge=1)
-    pages: List[VectorPage] = Field(..., min_items=1)
+    page_number: int
+    pages: List[VectorPage]
 
 class VisionRegion(BaseModel):
-    label: str = Field(..., min_length=1)
-    coordinate_block: List[float] = Field(..., min_items=4, max_items=4)
-
-    @validator('coordinate_block')
-    def validate_coord_block(cls, v):
-        if v[0] >= v[2] or v[1] >= v[3]:
-            raise ValueError('Invalid coordinate block: x0 < x1 and y0 < y1 required')
-        return v
-
-class ImageMetadata(BaseModel):
-    image_width_pixels: int = Field(..., ge=1)
-    image_height_pixels: int = Field(..., ge=1)
-    image_dpi_x: Optional[float] = Field(default=None, ge=1.0)
-    image_dpi_y: Optional[float] = Field(default=None, ge=1.0)
+    label: str
+    coordinate_block: List[float]
 
 class VisionOutput(BaseModel):
-    drawing_type: str = Field(..., pattern="^(plattegrond|gevelaanzicht|detailtekening|doorsnede|bestektekening|installatietekening|unknown)$")
-    scale_api_version: str = Field(..., min_length=1)
-    regions: List[VisionRegion] = Field(..., min_items=0)
-    image_metadata: ImageMetadata
+    drawing_type: str
+    regions: List[VisionRegion]
+    image_metadata: Optional[Dict] = None
 
 class FilterInput(BaseModel):
     vector_data: VectorData
     vision_output: VisionOutput
 
-class FilteredLine(BaseModel):
-    p1: List[float]
-    p2: List[float]
+# Clean Output Models - Only Essential Data
+class CleanPoint(BaseModel):
+    x: float
+    y: float
+
+class CleanLine(BaseModel):
+    p1: CleanPoint
+    p2: CleanPoint
     length: float
-    stroke_width: float
     orientation: str
-    midpoint: List[float]
+    midpoint: CleanPoint
 
-class FilteredRegion(BaseModel):
+class CleanText(BaseModel):
+    text: str
+    position: CleanPoint
+    bounding_box: List[float]  # [x1, y1, x2, y2]
+
+class RegionData(BaseModel):
     label: str
-    bounding_box: List[float]
-    lines: List[FilteredLine]
-    texts: List[VectorText]
+    lines: List[CleanLine]
+    texts: List[CleanText]
 
-class UnassignedElements(BaseModel):
-    lines: List[FilteredLine]
-    texts: List[VectorText]
-
-class FilteredData(BaseModel):
-    page_number: int
+class CleanOutput(BaseModel):
     drawing_type: str
-    scale_api_version: str
-    regions: List[FilteredRegion]
-    unassigned: UnassignedElements
+    regions: List[RegionData]
 
-class FilterOutput(BaseModel):
-    status: str = "success"
-    message: str = "Filtered data"
-    data: FilteredData
-
-# Helper functions
 def calculate_orientation(p1: List[float], p2: List[float], angle: Optional[float] = None) -> str:
+    """Calculate line orientation"""
     if angle is not None:
         normalized_angle = abs(angle % 180)
-        if normalized_angle < 10 or normalized_angle > 170:
+        if normalized_angle < 15 or normalized_angle > 165:
             return "horizontal"
-        elif 80 < normalized_angle < 100:
+        elif 75 < normalized_angle < 105:
             return "vertical"
         else:
             return "diagonal"
     else:
         dx = abs(p2[0] - p1[0])
         dy = abs(p2[1] - p1[1])
-        if dx == 0:
+        
+        if dx < 1:  # Practically vertical
             return "vertical"
-        elif dy == 0:
+        elif dy < 1:  # Practically horizontal
             return "horizontal"
         else:
             angle_rad = math.atan2(dy, dx)
             angle_deg = math.degrees(angle_rad)
-            if angle_deg < 10 or angle_deg > 170:
+            if angle_deg < 15 or angle_deg > 165:
                 return "horizontal"
-            elif 80 < angle_deg < 100:
+            elif 75 < angle_deg < 105:
                 return "vertical"
             else:
                 return "diagonal"
 
-def calculate_midpoint(p1: List[float], p2: List[float]) -> List[float]:
-    return [(p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2]
+def calculate_midpoint(p1: List[float], p2: List[float]) -> CleanPoint:
+    """Calculate midpoint of a line"""
+    return CleanPoint(
+        x=round((p1[0] + p2[0]) / 2, 1),
+        y=round((p1[1] + p2[1]) / 2, 1)
+    )
 
-def line_in_region(line_p1: List[float], line_p2: List[float], region: List[float], buffer: float = 0) -> bool:
-    line = LineString([line_p1, line_p2])
-    region_box = box(region[0] - buffer, region[1] - buffer, region[2] + buffer, region[3] + buffer)
-    return line.intersects(region_box)
+def line_intersects_region(line_p1: List[float], line_p2: List[float], region: List[float]) -> bool:
+    """Check if line intersects with region (no buffer for precision)"""
+    try:
+        line = LineString([line_p1, line_p2])
+        region_box = box(region[0], region[1], region[2], region[3])
+        return line.intersects(region_box)
+    except Exception:
+        # Fallback: check if any endpoint is in region
+        x1, y1, x2, y2 = region
+        for x, y in [line_p1, line_p2]:
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                return True
+        return False
 
-def text_in_region(text: VectorText, region: List[float], buffer: float = 0) -> bool:
+def text_in_region(text: VectorText, region: List[float]) -> bool:
+    """Check if text center is in region"""
     center_x = (text.bounding_box[0] + text.bounding_box[2]) / 2
     center_y = (text.bounding_box[1] + text.bounding_box[3]) / 2
-    return center_x >= region[0] - buffer and center_x <= region[2] + buffer and \
-           center_y >= region[1] - buffer and center_y <= region[3] + buffer
-
-def calculate_region_area(region: List[float]) -> float:
     x1, y1, x2, y2 = region
-    return abs((x2 - x1) * (y2 - y1))
+    return x1 <= center_x <= x2 and y1 <= center_y <= y2
 
-@app.post("/filter/")
-@limiter.limit("10/minute")
-async def filter_data(request: Request, input_data: FilterInput, debug: bool = Query(False)):
-    """Filter lines per region based on drawing type, passing all texts with original coordinates."""
-    start_time = datetime.now()
-    errors = []
+def should_include_line(line: VectorLine, drawing_type: str, region_label: str) -> bool:
+    """Determine if line should be included based on drawing type and region"""
+    
+    # For plattegrond: include ALL lines regardless of length
+    if drawing_type == "plattegrond":
+        return True
+    
+    # For other drawing types, apply length filters
+    orientation = calculate_orientation(line.p1, line.p2, line.angle)
+    
+    if drawing_type == "gevelaanzicht":
+        return line.length > 40
+    elif drawing_type == "detailtekening":
+        return line.length > 25
+    elif drawing_type == "doorsnede":
+        return (line.length > 30 and orientation == "vertical") or line.is_dashed
+    elif drawing_type == "bestektekening":
+        label_lower = region_label.lower()
+        if "grond" in label_lower or "verdieping" in label_lower:
+            return True  # Plattegrond rules: all lines
+        elif "gevel" in label_lower:
+            return line.length > 40
+        elif "doorsnede" in label_lower:
+            return line.length > 30 and orientation == "vertical"
+        else:
+            return True  # Default: all lines
+    elif drawing_type == "installatietekening":
+        return line.stroke_width <= 1 or line.is_dashed
+    else:  # unknown
+        return line.length > 10
+
+@app.post("/filter/", response_model=CleanOutput)
+async def filter_clean(input_data: FilterInput):
+    """Filter data and return clean, focused output per region"""
     
     try:
+        # Get first page data
         if not input_data.vector_data.pages:
-            errors.append("No pages in vector_data")
             raise HTTPException(status_code=400, detail="No pages in vector_data")
-        
-        if input_data.vision_output.drawing_type in ["detailtekening", "unknown"] and not input_data.vision_output.regions:
-            errors.append(f"No regions provided for {input_data.vision_output.drawing_type}")
-            raise HTTPException(status_code=400, detail=f"No regions provided for {input_data.vision_output.drawing_type}")
         
         vector_page = input_data.vector_data.pages[0]
         drawing_type = input_data.vision_output.drawing_type
         regions = input_data.vision_output.regions
         
-        logger.info(f"Processing page {input_data.vector_data.page_number} of type {drawing_type}")
+        logger.info(f"Processing {drawing_type} with {len(regions)} regions")
+        logger.info(f"Input: {len(vector_page.lines)} lines, {len(vector_page.texts)} texts")
         
-        original_count = len(vector_page.lines) + len(vector_page.texts)
-        
-        filtered_regions = []
-        unassigned_lines = []
-        unassigned_texts = vector_page.texts.copy()
-        
-        if drawing_type == "unknown" and regions:
-            regions = [max(regions, key=lambda r: calculate_region_area(r.coordinate_block))]
+        region_outputs = []
         
         for region in regions:
             region_lines = []
             region_texts = []
             
-            # Include all texts in region
-            texts_to_remove = []
-            for text in unassigned_texts:
-                if text_in_region(text, region.coordinate_block, buffer=15 if drawing_type != "bestektekening" else 0):
-                    region_texts.append(text)
-                    texts_to_remove.append(text)
+            logger.info(f"Processing region: {region.label}")
             
-            for text in texts_to_remove:
-                unassigned_texts.remove(text)
-            
-            # Filter lines based on drawing_type
+            # Process lines for this region
             for line in vector_page.lines:
-                orientation = calculate_orientation(line.p1, line.p2, line.angle)
-                include = False
-                buffer = 15 if drawing_type != "bestektekening" else 0
-                
-                if line_in_region(line.p1, line.p2, region.coordinate_block, buffer=buffer):
-                    if drawing_type == "plattegrond":
-                        include = True
-                    elif drawing_type == "gevelaanzicht":
-                        include = line.length > 40
-                    elif drawing_type == "detailtekening":
-                        include = line.length > 25
-                    elif drawing_type == "doorsnede":
-                        include = (line.length > 30 and orientation == "vertical") or line.is_dashed
-                    elif drawing_type == "bestektekening":
-                        include = True  # All lines for bestektekening
-                    elif drawing_type == "installatietekening":
-                        include = line.stroke_width <= 1 or line.is_dashed
-                    elif drawing_type == "unknown":
-                        include = line.length > 10
-                
-                if include:
-                    filtered_line = FilteredLine(
-                        p1=line.p1,
-                        p2=line.p2,
-                        length=line.length,
-                        stroke_width=line.stroke_width,
-                        orientation=orientation,
-                        midpoint=calculate_midpoint(line.p1, line.p2)
-                    )
-                    region_lines.append(filtered_line)
+                # Check if line is in region
+                if line_intersects_region(line.p1, line.p2, region.coordinate_block):
+                    # Check if line should be included based on rules
+                    if should_include_line(line, drawing_type, region.label):
+                        clean_line = CleanLine(
+                            p1=CleanPoint(x=round(line.p1[0], 1), y=round(line.p1[1], 1)),
+                            p2=CleanPoint(x=round(line.p2[0], 1), y=round(line.p2[1], 1)),
+                            length=round(line.length, 1),
+                            orientation=calculate_orientation(line.p1, line.p2, line.angle),
+                            midpoint=calculate_midpoint(line.p1, line.p2)
+                        )
+                        region_lines.append(clean_line)
             
-            filtered_regions.append(FilteredRegion(
+            # Process texts for this region
+            for text in vector_page.texts:
+                if text_in_region(text, region.coordinate_block):
+                    clean_text = CleanText(
+                        text=text.text,
+                        position=CleanPoint(x=round(text.position[0], 1), y=round(text.position[1], 1)),
+                        bounding_box=[round(x, 1) for x in text.bounding_box]
+                    )
+                    region_texts.append(clean_text)
+            
+            # Create region output
+            region_data = RegionData(
                 label=region.label,
-                bounding_box=region.coordinate_block,
                 lines=region_lines,
                 texts=region_texts
-            ))
-        
-        # Handle unassigned lines
-        for line in vector_page.lines:
-            orientation = calculate_orientation(line.p1, line.p2, line.angle)
-            if all(not line_in_region(line.p1, line.p2, r.coordinate_block, buffer=15 if drawing_type != "bestektekening" else 0) for r in regions):
-                filtered_line = FilteredLine(
-                    p1=line.p1,
-                    p2=line.p2,
-                    length=line.length,
-                    stroke_width=line.stroke_width,
-                    orientation=orientation,
-                    midpoint=calculate_midpoint(line.p1, line.p2)
-                )
-                unassigned_lines.append(filtered_line)
-        
-        filtered_data = FilteredData(
-            page_number=input_data.vector_data.page_number,
-            drawing_type=drawing_type,
-            scale_api_version=input_data.vision_output.scale_api_version,
-            regions=filtered_regions,
-            unassigned=UnassignedElements(
-                lines=unassigned_lines,
-                texts=unassigned_texts
             )
+            region_outputs.append(region_data)
+            
+            logger.info(f"  {region.label}: {len(region_lines)} lines, {len(region_texts)} texts")
+        
+        # Create clean output - NO unassigned data, NO metadata
+        output = CleanOutput(
+            drawing_type=drawing_type,
+            regions=region_outputs
         )
         
-        logger.info(f"Processed {original_count} elements, filtered {len(unassigned_lines) + sum(len(r.lines) for r in filtered_regions)} lines and {len(vector_page.texts)} texts")
+        total_lines = sum(len(r.lines) for r in region_outputs)
+        total_texts = sum(len(r.texts) for r in region_outputs)
         
-        return FilterOutput(
-            status="success",
-            message="Filtered lines per region and all texts with original coordinates",
-            data=filtered_data
-        )
+        logger.info(f"✅ Clean filtering completed:")
+        logger.info(f"  Total output: {total_lines} lines, {total_texts} texts")
+        logger.info(f"  Regions: {len(region_outputs)}")
+        
+        return output
     
     except HTTPException as e:
         raise e
-    except ValueError as e:
-        logger.error(f"Validation error: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        logger.error(f"Error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "Filter API",
-        "version": "2.0.0",
-        "timestamp": datetime.now().isoformat()
+        "service": "Clean Filter API",
+        "version": "3.0.0"
+    }
+
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "title": "Clean Filter API",
+        "version": "3.0.0",
+        "description": "Returns clean, focused output per region - only essential data",
+        "features": [
+            "Clean output per region only",
+            "No unassigned data",
+            "No unnecessary metadata",
+            "Precise line filtering with orientation and midpoint",
+            "Text with bounding box preserved",
+            "Plattegrond includes ALL lines regardless of length"
+        ],
+        "output_structure": {
+            "drawing_type": "string",
+            "regions": [
+                {
+                    "label": "region name",
+                    "lines": [
+                        {
+                            "p1": {"x": float, "y": float},
+                            "p2": {"x": float, "y": float},
+                            "length": float,
+                            "orientation": "horizontal|vertical|diagonal",
+                            "midpoint": {"x": float, "y": float}
+                        }
+                    ],
+                    "texts": [
+                        {
+                            "text": "string",
+                            "position": {"x": float, "y": float},
+                            "bounding_box": [x1, y1, x2, y2]
+                        }
+                    ]
+                }
+            ]
+        }
     }
 
 if __name__ == "__main__":
