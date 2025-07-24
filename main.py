@@ -14,9 +14,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Clean Filter API",
-    description="Returns clean, focused output per region - only essential data",
-    version="3.0.0"
+    title="Clean Filter API - Compatible with Vector Drawing API",
+    description="Returns clean, focused output per region - works with Vector Drawing API format",
+    version="3.1.0"
 )
 
 # CORS middleware
@@ -28,14 +28,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Input Models
+# Input Models - Compatible with Vector Drawing API
 class VectorLine(BaseModel):
     p1: List[float]
     p2: List[float] 
-    stroke_width: float
+    stroke_width: float = Field(default=1.0)
     length: float
-    color: List[int]
-    is_dashed: bool = False
+    color: List[int] = Field(default=[0, 0, 0])
+    is_dashed: bool = Field(default=False)
     angle: Optional[float] = None
 
 class VectorText(BaseModel):
@@ -194,6 +194,116 @@ def should_include_line(line: VectorLine, drawing_type: str, region_label: str) 
     else:  # unknown
         return line.length > 10  # Unknown: lines > 10pt
 
+def convert_vector_drawing_api_format(raw_vector_data: Dict) -> VectorData:
+    """Convert Vector Drawing API format to our internal format"""
+    try:
+        logger.info("=== Converting Vector Drawing API format ===")
+        
+        pages = raw_vector_data.get("pages", [])
+        if not pages:
+            raise ValueError("No pages found in vector data")
+        
+        converted_pages = []
+        
+        for page_data in pages:
+            page_size = page_data.get("page_size", {"width": 595.0, "height": 842.0})
+            
+            # Extract texts - direct format
+            texts = []
+            for text_data in page_data.get("texts", []):
+                position = text_data.get("position", {"x": 0, "y": 0})
+                bbox = text_data.get("bbox", {})
+                
+                # Convert position to [x, y] format
+                if isinstance(position, dict):
+                    pos_list = [float(position.get("x", 0)), float(position.get("y", 0))]
+                else:
+                    pos_list = [float(position[0]), float(position[1])]
+                
+                # Convert bbox to [x1, y1, x2, y2] format  
+                if isinstance(bbox, dict):
+                    bbox_list = [
+                        float(bbox.get("x0", 0)), 
+                        float(bbox.get("y0", 0)), 
+                        float(bbox.get("x1", 100)), 
+                        float(bbox.get("y1", 20))
+                    ]
+                else:
+                    bbox_list = [float(x) for x in bbox[:4]] if len(bbox) >= 4 else [0, 0, 100, 20]
+                
+                text = VectorText(
+                    text=text_data.get("text", ""),
+                    position=pos_list,
+                    font_size=text_data.get("font_size", 12.0),
+                    bounding_box=bbox_list
+                )
+                texts.append(text)
+            
+            # Extract lines from drawings
+            lines = []
+            drawings = page_data.get("drawings", {})
+            
+            logger.info(f"Drawings structure: {list(drawings.keys())}")
+            
+            for line_data in drawings.get("lines", []):
+                logger.info(f"Processing line: {line_data}")
+                
+                # Handle Vector Drawing API format: {"type": "line", "p1": {"x": 100, "y": 200}, "p2": {"x": 300, "y": 400}, "length": 250}
+                p1 = line_data.get("p1", {"x": 0, "y": 0})
+                p2 = line_data.get("p2", {"x": 0, "y": 0})
+                
+                # Convert to [x, y] format
+                if isinstance(p1, dict):
+                    p1_list = [float(p1.get("x", 0)), float(p1.get("y", 0))]
+                else:
+                    p1_list = [float(p1[0]), float(p1[1])]
+                
+                if isinstance(p2, dict):
+                    p2_list = [float(p2.get("x", 0)), float(p2.get("y", 0))]
+                else:
+                    p2_list = [float(p2[0]), float(p2[1])]
+                
+                # Get other properties
+                length = float(line_data.get("length", 0))
+                width = float(line_data.get("width", 1.0))
+                color = line_data.get("color", [0, 0, 0])
+                
+                line = VectorLine(
+                    p1=p1_list,
+                    p2=p2_list,
+                    stroke_width=width,
+                    length=length,
+                    color=color,
+                    is_dashed=line_data.get("is_dashed", False),
+                    angle=line_data.get("angle")
+                )
+                lines.append(line)
+                
+                logger.info(f"Converted line: {p1_list} -> {p2_list}, length: {length}")
+            
+            page = VectorPage(
+                page_size=page_size,
+                lines=lines,
+                texts=texts
+            )
+            converted_pages.append(page)
+        
+        result = VectorData(
+            page_number=1,
+            pages=converted_pages
+        )
+        
+        total_lines = sum(len(page.lines) for page in converted_pages)
+        total_texts = sum(len(page.texts) for page in converted_pages)
+        
+        logger.info(f"✅ Converted Vector Drawing API data: {total_lines} lines, {total_texts} texts")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error converting Vector Drawing API format: {e}")
+        raise ValueError(f"Failed to convert Vector Drawing API format: {str(e)}")
+
 @app.post("/filter/", response_model=CleanOutput)
 async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
     """Filter data and return clean, focused output per region"""
@@ -293,10 +403,6 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
         
         if total_lines == 0:
             logger.warning("⚠️  NO LINES FOUND! This suggests a coordinate system or intersection problem.")
-            logger.warning(f"Sample region bounds: {regions[0].coordinate_block if regions else 'None'}")
-            if vector_page.lines:
-                sample_line = vector_page.lines[0]
-                logger.warning(f"Sample line: {sample_line.p1} -> {sample_line.p2}")
         
         return output
     
@@ -306,151 +412,72 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
         logger.error(f"Error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-@app.post("/debug/", response_model=Dict[str, Any])
-async def debug_filter(input_data: FilterInput):
-    """Debug endpoint to diagnose line filtering issues"""
+@app.post("/filter-from-vector-api/", response_model=CleanOutput)
+async def filter_from_vector_api(
+    vector_data: Dict[str, Any], 
+    vision_output: Dict[str, Any],
+    debug: bool = Query(False)
+):
+    """Direct endpoint that accepts raw Vector Drawing API output"""
     
     try:
-        vector_page = input_data.vector_data.pages[0]
-        regions = input_data.vision_output.regions
+        logger.info("=== Processing raw Vector Drawing API output ===")
         
-        debug_info = {
-            "total_lines": len(vector_page.lines),
-            "total_texts": len(vector_page.texts),
-            "drawing_type": input_data.vision_output.drawing_type,
-            "regions": [],
-            "sample_lines": [],
-            "coordinate_analysis": {}
-        }
+        # Convert Vector Drawing API format to our internal format
+        converted_vector_data = convert_vector_drawing_api_format(vector_data)
         
-        # Sample first 5 lines
-        for i, line in enumerate(vector_page.lines[:5]):
-            debug_info["sample_lines"].append({
-                "index": i,
-                "p1": line.p1,
-                "p2": line.p2,
-                "length": line.length,
-                "stroke_width": line.stroke_width
-            })
+        # Create vision output object
+        vision_obj = VisionOutput(**vision_output)
         
-        # Analyze coordinate ranges
-        if vector_page.lines:
-            all_x = []
-            all_y = []
-            for line in vector_page.lines:
-                all_x.extend([line.p1[0], line.p2[0]])
-                all_y.extend([line.p1[1], line.p2[1]])
-            
-            debug_info["coordinate_analysis"] = {
-                "x_range": [min(all_x), max(all_x)],
-                "y_range": [min(all_y), max(all_y)],
-                "total_points": len(all_x)
-            }
+        # Create filter input
+        filter_input = FilterInput(
+            vector_data=converted_vector_data,
+            vision_output=vision_obj
+        )
         
-        # Test each region
-        for region in regions:
-            region_debug = {
-                "label": region.label,
-                "bounds": region.coordinate_block,
-                "lines_in_region": 0,
-                "lines_included": 0,
-                "texts_in_region": 0,
-                "sample_intersections": []
-            }
-            
-            # Test line intersections
-            for i, line in enumerate(vector_page.lines[:10]):  # First 10 lines
-                is_in_region = line_intersects_region(line.p1, line.p2, region.coordinate_block)
-                if is_in_region:
-                    region_debug["lines_in_region"] += 1
-                    should_include = should_include_line(line, input_data.vision_output.drawing_type, region.label)
-                    if should_include:
-                        region_debug["lines_included"] += 1
-                
-                if i < 5:  # Sample first 5
-                    region_debug["sample_intersections"].append({
-                        "line_index": i,
-                        "p1": line.p1,
-                        "p2": line.p2,
-                        "in_region": is_in_region,
-                        "would_include": should_include_line(line, input_data.vision_output.drawing_type, region.label) if is_in_region else False
-                    })
-            
-            # Count texts in region
-            for text in vector_page.texts:
-                if text_in_region(text, region.coordinate_block):
-                    region_debug["texts_in_region"] += 1
-            
-            debug_info["regions"].append(region_debug)
+        # Process using the main filter function
+        return await filter_clean(filter_input, debug)
         
-        return debug_info
-    
     except Exception as e:
-        logger.error(f"Debug error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Debug error: {str(e)}")
+        logger.error(f"Error processing Vector API output: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing Vector API output: {str(e)}")
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "Clean Filter API",
-        "version": "3.0.0"
+        "service": "Clean Filter API - Vector Drawing API Compatible",
+        "version": "3.1.0"
     }
 
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
-        "title": "Clean Filter API",
-        "version": "3.0.0",
-        "description": "Returns clean, focused output per region - only essential data",
+        "title": "Clean Filter API - Vector Drawing API Compatible",
+        "version": "3.1.0",
+        "description": "Returns clean, focused output per region - works with Vector Drawing API format",
         "features": [
+            "Compatible with Vector Drawing API format",
             "Clean output per region only",
             "No unassigned data", 
-            "No unnecessary metadata",
-            "Precise line filtering with orientation and midpoint",
-            "Text with bounding box preserved",
             "Correct length filtering per drawing type",
-            "Debug endpoint for troubleshooting"
+            "Processes p1/p2 as {x,y} objects or [x,y] arrays"
         ],
         "drawing_types": {
             "plattegrond": "Lines > 50pt",
             "gevelaanzicht": "Lines > 40pt",
             "detailtekening": "Lines > 25pt", 
             "doorsnede": "Vertical lines > 30pt OR dashed lines",
-            "bestektekening": "Region-specific rules (grond>50pt, gevel>40pt, doorsnede=vertical>30pt, default>25pt)",
+            "bestektekening": "Region-specific rules",
             "installatietekening": "Lines ≤ 1pt stroke OR dashed",
             "unknown": "Lines > 10pt"
         },
         "endpoints": {
-            "/filter/": "Main filtering endpoint",
-            "/debug/": "Debug line intersection issues",
-            "/filter/?debug=true": "Filter with debug logging"
-        },
-        "output_structure": {
-            "drawing_type": "string",
-            "regions": [
-                {
-                    "label": "region name",
-                    "lines": [
-                        {
-                            "p1": {"x": "float", "y": "float"},
-                            "p2": {"x": "float", "y": "float"},
-                            "length": "float",
-                            "orientation": "horizontal|vertical|diagonal",
-                            "midpoint": {"x": "float", "y": "float"}
-                        }
-                    ],
-                    "texts": [
-                        {
-                            "text": "string",
-                            "position": {"x": "float", "y": "float"},
-                            "bounding_box": "[x1, y1, x2, y2]"
-                        }
-                    ]
-                }
-            ]
+            "/filter/": "Main filtering endpoint (requires converted format)",
+            "/filter-from-vector-api/": "Direct endpoint for Vector Drawing API output",
+            "/health": "Health check"
         }
     }
 
