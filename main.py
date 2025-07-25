@@ -1,6 +1,7 @@
 import os
 import logging
 import json
+import re
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -126,6 +127,92 @@ def calculate_midpoint(p1: List[float], p2: List[float]) -> CleanPoint:
         y=round((p1[1] + p2[1]) / 2, 1)
     )
 
+def is_dimension_text(text: str) -> bool:
+    """
+    Determine if a text string represents a dimension measurement.
+    Returns True if text contains dimensional information.
+    """
+    if not text or not text.strip():
+        return False
+    
+    text_clean = text.strip()
+    
+    # 1. Must contain at least one number
+    if not re.search(r'\d', text_clean):
+        return False
+    
+    # 2. Exclude labels and room names
+    exclude_patterns = [
+        r'(?i)(slaapkamer|overloop|badkamer|zolder|installatie|wm|hwa|wtw|rm|balustrade|geen\s+bovenlicht)',
+        r'(?i)(keuken|woonkamer|garage|berging|toilet|gang|hal|vide|dak|kelder)',
+        r'(?i)(deur|raam|venster|trap|schuifdeur|openslaande)'
+    ]
+    
+    for pattern in exclude_patterns:
+        if re.search(pattern, text_clean):
+            return False
+    
+    # 3. Check for dimension patterns
+    dimension_patterns = [
+        r'^\d+$',                          # Pure numbers: "2050", "1000"
+        r'^\d+\+vl$',                      # Door/window format: "1000+vl"
+        r'^\d+(mm|cm|m)$',                 # With units: "2050mm", "105cm"
+        r'^\d+x\d+(mm|cm)?$',              # Format like "94x140cm"
+        r'^\d+\s?(mm|cm|m)$',              # With space: "2050 mm"
+    ]
+    
+    is_dimension = False
+    for pattern in dimension_patterns:
+        if re.match(pattern, text_clean):
+            is_dimension = True
+            break
+    
+    if not is_dimension:
+        return False
+    
+    # 4. Extract numeric value and check minimum threshold
+    extracted_value = extract_dimension_value(text_clean)
+    if extracted_value is None or extracted_value < 100:  # Minimum 100mm
+        return False
+    
+    logger.debug(f"Identified dimension text: '{text_clean}' -> {extracted_value}mm")
+    return True
+
+def extract_dimension_value(text: str) -> Optional[float]:
+    """
+    Extract numeric dimension value from text and convert to mm.
+    Returns None if no valid dimension found.
+    """
+    text_clean = text.strip()
+    
+    # Handle "94x140cm" format - take the maximum value
+    match = re.match(r'^(\d+)x(\d+)(mm|cm)?$', text_clean)
+    if match:
+        val1, val2, unit = match.groups()
+        max_val = max(int(val1), int(val2))
+        
+        if unit == 'cm':
+            return max_val * 10  # Convert cm to mm
+        elif unit == 'mm':
+            return max_val
+        else:
+            return max_val  # Assume mm if no unit
+    
+    # Handle single values with units
+    match = re.match(r'^(\d+)\s?(mm|cm|m|\+vl)?$', text_clean)
+    if match:
+        value, unit = match.groups()
+        value = int(value)
+        
+        if unit == 'cm':
+            return value * 10  # Convert cm to mm
+        elif unit == 'm':
+            return value * 1000  # Convert m to mm
+        else:
+            return value  # Assume mm for no unit or +vl
+    
+    return None
+
 def line_intersects_region(line_p1: List[float], line_p2: List[float], region: List[float]) -> bool:
     """Check if line intersects with region - with extensive debugging"""
     x1, y1, x2, y2 = region
@@ -180,8 +267,18 @@ def should_include_line(line: VectorLine, drawing_type: str, region_label: str) 
     orientation = calculate_orientation(line.p1, line.p2, line.angle)
     
     if drawing_type == "plattegrond":
-        include = line.length > 50
-        logger.debug(f"  Plattegrond filter: length {line.length:.1f} > 50 = {include}")
+        # Special rules for plattegrond: filter on length ≥100pt and only horizontal/vertical
+        if line.length < 100:
+            logger.debug(f"  Plattegrond filter: length {line.length:.1f} < 100 = excluded")
+            return False
+        
+        # Only include horizontal and vertical lines for plattegrond
+        if orientation not in ["horizontal", "vertical"]:
+            logger.debug(f"  Plattegrond filter: orientation '{orientation}' not horizontal/vertical = excluded")
+            return False
+        
+        include = line.length >= 100
+        logger.debug(f"  Plattegrond filter: length {line.length:.1f} >= 100 and orientation '{orientation}' = {include}")
         return include
     elif drawing_type == "gevelaanzicht":
         return line.length > 40
@@ -203,6 +300,54 @@ def should_include_line(line: VectorLine, drawing_type: str, region_label: str) 
         return line.stroke_width <= 1 or line.is_dashed
     else:
         return line.length > 10
+
+def should_include_text(text: VectorText, drawing_type: str, region_label: str) -> bool:
+    """Determine if text should be included based on drawing type and content"""
+    
+    if drawing_type == "plattegrond":
+        # For plattegrond, prioritize dimension texts
+        if is_dimension_text(text.text):
+            logger.debug(f"  Plattegrond: including dimension text '{text.text}'")
+            return True
+        else:
+            # Still include other texts but log them as non-dimension
+            logger.debug(f"  Plattegrond: including non-dimension text '{text.text}'")
+            return True
+    
+    # For other drawing types, include all texts (existing behavior)
+    return True
+
+def remove_duplicate_lines(lines: List[VectorLine]) -> List[VectorLine]:
+    """Remove duplicate lines based on p1, p2 coordinates with small tolerance"""
+    unique_lines = []
+    tolerance = 1.0  # 1 point tolerance for coordinate comparison
+    
+    for line in lines:
+        is_duplicate = False
+        
+        for existing_line in unique_lines:
+            # Check if coordinates are within tolerance
+            p1_match = (abs(line.p1[0] - existing_line.p1[0]) < tolerance and 
+                       abs(line.p1[1] - existing_line.p1[1]) < tolerance)
+            p2_match = (abs(line.p2[0] - existing_line.p2[0]) < tolerance and 
+                       abs(line.p2[1] - existing_line.p2[1]) < tolerance)
+            
+            # Also check reverse direction
+            p1_reverse = (abs(line.p1[0] - existing_line.p2[0]) < tolerance and 
+                         abs(line.p1[1] - existing_line.p2[1]) < tolerance)
+            p2_reverse = (abs(line.p2[0] - existing_line.p1[0]) < tolerance and 
+                         abs(line.p2[1] - existing_line.p1[1]) < tolerance)
+            
+            if (p1_match and p2_match) or (p1_reverse and p2_reverse):
+                is_duplicate = True
+                logger.debug(f"  Removing duplicate line: [{line.p1[0]:.1f},{line.p1[1]:.1f}] -> [{line.p2[0]:.1f},{line.p2[1]:.1f}]")
+                break
+        
+        if not is_duplicate:
+            unique_lines.append(line)
+    
+    logger.info(f"Removed {len(lines) - len(unique_lines)} duplicate lines ({len(lines)} -> {len(unique_lines)})")
+    return unique_lines
 
 def convert_vector_drawing_api_format(raw_vector_data: Dict) -> VectorData:
     """Convert Vector Drawing API format to our internal format with extensive debugging"""
@@ -381,10 +526,20 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
         if len(vector_page.lines) == 0:
             logger.error("NO LINES IN INPUT DATA!")
         
+        # Apply plattegrond-specific preprocessing
+        processed_lines = vector_page.lines
+        if drawing_type == "plattegrond":
+            logger.info(f"Applying plattegrond-specific preprocessing...")
+            
+            # Remove duplicate lines
+            processed_lines = remove_duplicate_lines(processed_lines)
+            
+            logger.info(f"After preprocessing: {len(processed_lines)} lines")
+        
         # Log first few lines and regions for debugging
-        if vector_page.lines:
+        if processed_lines:
             logger.info("First 3 lines:")
-            for i, line in enumerate(vector_page.lines[:3]):
+            for i, line in enumerate(processed_lines[:3]):
                 logger.info(f"  Line {i}: [{line.p1[0]:.1f},{line.p1[1]:.1f}] -> [{line.p2[0]:.1f},{line.p2[1]:.1f}], length={line.length:.1f}")
         
         logger.info("Regions:")
@@ -395,17 +550,19 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
         total_lines_checked = 0
         total_lines_in_regions = 0
         total_lines_included = 0
+        total_dimension_texts = 0
         
         for region in regions:
             region_lines = []
             region_texts = []
             lines_in_this_region = 0
+            dimension_texts_in_region = 0
             
             logger.info(f"\nProcessing region: {region.label}")
             logger.info(f"  Region bounds: {region.coordinate_block}")
             
             # Process lines for this region
-            for i, line in enumerate(vector_page.lines):
+            for i, line in enumerate(processed_lines):
                 total_lines_checked += 1
                 
                 # Check if line is in region
@@ -434,12 +591,20 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
             for text in vector_page.texts:
                 if text_in_region(text, region.coordinate_block):
                     texts_in_region += 1
-                    clean_text = CleanText(
-                        text=text.text,
-                        position=CleanPoint(x=round(text.position[0], 1), y=round(text.position[1], 1)),
-                        bounding_box=[round(x, 1) for x in text.bounding_box]
-                    )
-                    region_texts.append(clean_text)
+                    
+                    # Check if text should be included
+                    if should_include_text(text, drawing_type, region.label):
+                        # Check if it's a dimension text for statistics
+                        if drawing_type == "plattegrond" and is_dimension_text(text.text):
+                            dimension_texts_in_region += 1
+                            total_dimension_texts += 1
+                        
+                        clean_text = CleanText(
+                            text=text.text,
+                            position=CleanPoint(x=round(text.position[0], 1), y=round(text.position[1], 1)),
+                            bounding_box=[round(x, 1) for x in text.bounding_box]
+                        )
+                        region_texts.append(clean_text)
             
             # Create region output
             region_data = RegionData(
@@ -453,6 +618,8 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
             logger.info(f"    Lines in region: {lines_in_this_region}")
             logger.info(f"    Lines included: {len(region_lines)}")
             logger.info(f"    Texts in region: {texts_in_region}")
+            if drawing_type == "plattegrond":
+                logger.info(f"    Dimension texts: {dimension_texts_in_region}")
         
         # Create clean output
         output = CleanOutput(
@@ -465,6 +632,8 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
         logger.info(f"Total lines in any region: {total_lines_in_regions}")
         logger.info(f"Total lines included: {total_lines_included}")
         logger.info(f"Total texts: {sum(len(r.texts) for r in region_outputs)}")
+        if drawing_type == "plattegrond":
+            logger.info(f"Total dimension texts identified: {total_dimension_texts}")
         
         if total_lines_included == 0:
             logger.error("⚠️ NO LINES INCLUDED IN OUTPUT!")
@@ -472,6 +641,8 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
             logger.error("1. No lines in input data")
             logger.error("2. Region coordinates don't match line coordinates")
             logger.error("3. All lines filtered out by length requirements")
+            if drawing_type == "plattegrond":
+                logger.error("4. All lines filtered out by plattegrond rules (length < 100 or not horizontal/vertical)")
         
         return output
     
@@ -530,6 +701,12 @@ async def root():
             "Multiple line location checks",
             "Detailed intersection debugging",
             "Line count tracking at each stage"
+        ],
+        "new_features": [
+            "Plattegrond-specific filtering (length ≥100pt, horizontal/vertical only)",
+            "Dimension text detection with regex patterns",
+            "Duplicate line removal for plattegrond",
+            "Enhanced text filtering for dimensional data"
         ],
         "endpoints": {
             "/filter/": "Main filtering endpoint",
