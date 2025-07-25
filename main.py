@@ -531,8 +531,20 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
         if drawing_type == "plattegrond":
             logger.info(f"Applying plattegrond-specific preprocessing...")
             
-            # Remove duplicate lines
-            processed_lines = remove_duplicate_lines(processed_lines)
+            # Step 1: Filter by length first (≥100pt)
+            length_filtered_lines = [line for line in processed_lines if line.length >= 100]
+            logger.info(f"After length filter (≥100pt): {len(length_filtered_lines)} lines (from {len(processed_lines)})")
+            
+            # Step 2: Filter by orientation (only horizontal/vertical)
+            orientation_filtered_lines = []
+            for line in length_filtered_lines:
+                orientation = calculate_orientation(line.p1, line.p2, line.angle)
+                if orientation in ["horizontal", "vertical"]:
+                    orientation_filtered_lines.append(line)
+            logger.info(f"After orientation filter (horizontal/vertical): {len(orientation_filtered_lines)} lines (from {len(length_filtered_lines)})")
+            
+            # Step 3: Remove duplicate lines (now much fewer lines to check)
+            processed_lines = remove_duplicate_lines(orientation_filtered_lines)
             
             logger.info(f"After preprocessing: {len(processed_lines)} lines")
         
