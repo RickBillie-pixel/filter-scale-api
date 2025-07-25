@@ -155,7 +155,6 @@ def is_dimension_text(text: str) -> bool:
     # 3. Check for dimension patterns
     dimension_patterns = [
         r'^\d+$',                          # Pure numbers: "2050", "1000"
-        r'^\d+\+vl$',                      # Door/window format: "1000+vl"
         r'^\d+(mm|cm|m)$',                 # With units: "2050mm", "105cm"
         r'^\d+x\d+(mm|cm)?$',              # Format like "94x140cm"
         r'^\d+\s?(mm|cm|m)$',              # With space: "2050 mm"
