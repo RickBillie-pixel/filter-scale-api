@@ -267,9 +267,9 @@ def should_include_line(line: VectorLine, drawing_type: str, region_label: str) 
     orientation = calculate_orientation(line.p1, line.p2, line.angle)
     
     if drawing_type == "plattegrond":
-        # Special rules for plattegrond: filter on length ≥100pt and only horizontal/vertical
-        if line.length < 100:
-            logger.debug(f"  Plattegrond filter: length {line.length:.1f} < 100 = excluded")
+        # Special rules for plattegrond: filter on length ≥200pt and only horizontal/vertical
+        if line.length < 200:
+            logger.debug(f"  Plattegrond filter: length {line.length:.1f} < 200 = excluded")
             return False
         
         # Only include horizontal and vertical lines for plattegrond
@@ -277,8 +277,8 @@ def should_include_line(line: VectorLine, drawing_type: str, region_label: str) 
             logger.debug(f"  Plattegrond filter: orientation '{orientation}' not horizontal/vertical = excluded")
             return False
         
-        include = line.length >= 100
-        logger.debug(f"  Plattegrond filter: length {line.length:.1f} >= 100 and orientation '{orientation}' = {include}")
+        include = line.length >= 200
+        logger.debug(f"  Plattegrond filter: length {line.length:.1f} >= 200 and orientation '{orientation}' = {include}")
         return include
     elif drawing_type == "gevelaanzicht":
         return line.length > 40
