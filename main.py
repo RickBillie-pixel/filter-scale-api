@@ -9,14 +9,14 @@ from pydantic import BaseModel, Field
 from shapely.geometry import LineString, box
 import math
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Configure logging with more detail
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Clean Filter API - Compatible with Vector Drawing API",
-    description="Returns clean, focused output per region - works with Vector Drawing API format",
-    version="3.1.0"
+    title="Debug Filter API - Vector Drawing Compatible",
+    description="Debug version to find why no lines are returned",
+    version="3.2.0-debug"
 )
 
 # CORS middleware
@@ -24,11 +24,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["POST", "GET"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Input Models - Compatible with Vector Drawing API
+# Models remain the same...
 class VectorLine(BaseModel):
     p1: List[float]
     p2: List[float] 
@@ -66,7 +66,6 @@ class FilterInput(BaseModel):
     vector_data: VectorData
     vision_output: VisionOutput
 
-# Clean Output Models - Only Essential Data
 class CleanPoint(BaseModel):
     x: float
     y: float
@@ -81,7 +80,7 @@ class CleanLine(BaseModel):
 class CleanText(BaseModel):
     text: str
     position: CleanPoint
-    bounding_box: List[float]  # [x1, y1, x2, y2]
+    bounding_box: List[float]
 
 class RegionData(BaseModel):
     label: str
@@ -106,9 +105,9 @@ def calculate_orientation(p1: List[float], p2: List[float], angle: Optional[floa
         dx = abs(p2[0] - p1[0])
         dy = abs(p2[1] - p1[1])
         
-        if dx < 1:  # Practically vertical
+        if dx < 1:
             return "vertical"
-        elif dy < 1:  # Practically horizontal
+        elif dy < 1:
             return "horizontal"
         else:
             angle_rad = math.atan2(dy, dx)
@@ -128,99 +127,120 @@ def calculate_midpoint(p1: List[float], p2: List[float]) -> CleanPoint:
     )
 
 def line_intersects_region(line_p1: List[float], line_p2: List[float], region: List[float]) -> bool:
-    """Check if line intersects with region - improved with debugging and multiple methods"""
+    """Check if line intersects with region - with extensive debugging"""
     x1, y1, x2, y2 = region
+    
+    logger.debug(f"Checking line [{line_p1[0]:.1f},{line_p1[1]:.1f}] -> [{line_p2[0]:.1f},{line_p2[1]:.1f}] against region [{x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}]")
     
     # Method 1: Check if any endpoint is in region
     for x, y in [line_p1, line_p2]:
         if x1 <= x <= x2 and y1 <= y <= y2:
+            logger.debug(f"  ✓ Endpoint in region: [{x:.1f},{y:.1f}]")
             return True
     
-    # Method 2: Check if line completely spans the region in x or y direction
+    # Method 2: Check line bounds overlap with region
     line_x1, line_y1 = line_p1
     line_x2, line_y2 = line_p2
     
-    # Check if line completely spans the region in x or y direction
-    if ((line_x1 <= x1 and line_x2 >= x2) or (line_x1 >= x2 and line_x2 <= x1)) and \
-       ((min(line_y1, line_y2) <= y2) and (max(line_y1, line_y2) >= y1)):
-        return True
-        
-    if ((line_y1 <= y1 and line_y2 >= y2) or (line_y1 >= y2 and line_y2 <= y1)) and \
-       ((min(line_x1, line_x2) <= x2) and (max(line_x1, line_x2) >= x1)):
-        return True
+    line_min_x = min(line_x1, line_x2)
+    line_max_x = max(line_x1, line_x2)
+    line_min_y = min(line_y1, line_y2)
+    line_max_y = max(line_y1, line_y2)
     
-    # Method 3: Use Shapely as fallback (with error handling)
+    # Check if bounding boxes overlap
+    if line_max_x < x1 or line_min_x > x2 or line_max_y < y1 or line_min_y > y2:
+        logger.debug(f"  ✗ Bounding boxes don't overlap")
+        return False
+    
+    # Method 3: Use Shapely for precise intersection
     try:
         line = LineString([line_p1, line_p2])
         region_box = box(x1, y1, x2, y2)
-        return line.intersects(region_box)
+        intersects = line.intersects(region_box)
+        logger.debug(f"  Shapely result: {intersects}")
+        return intersects
     except Exception as e:
-        logger.warning(f"Shapely intersection failed: {e}")
-        
-    return False
+        logger.warning(f"  Shapely failed: {e}")
+        return False
 
 def text_in_region(text: VectorText, region: List[float]) -> bool:
     """Check if text center is in region"""
     center_x = (text.bounding_box[0] + text.bounding_box[2]) / 2
     center_y = (text.bounding_box[1] + text.bounding_box[3]) / 2
     x1, y1, x2, y2 = region
-    return x1 <= center_x <= x2 and y1 <= center_y <= y2
+    in_region = x1 <= center_x <= x2 and y1 <= center_y <= y2
+    
+    if in_region:
+        logger.debug(f"Text '{text.text}' at [{center_x:.1f},{center_y:.1f}] is in region [{x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}]")
+    
+    return in_region
 
 def should_include_line(line: VectorLine, drawing_type: str, region_label: str) -> bool:
     """Determine if line should be included based on drawing type and region"""
-    
     orientation = calculate_orientation(line.p1, line.p2, line.angle)
     
     if drawing_type == "plattegrond":
-        return line.length > 50  # ✅ CORRECT: Plattegrond lines > 50pt
+        include = line.length > 50
+        logger.debug(f"  Plattegrond filter: length {line.length:.1f} > 50 = {include}")
+        return include
     elif drawing_type == "gevelaanzicht":
-        return line.length > 40  # Gevelaanzicht: lines > 40pt
+        return line.length > 40
     elif drawing_type == "detailtekening":
-        return line.length > 25  # Detailtekening: lines > 25pt
+        return line.length > 25
     elif drawing_type == "doorsnede":
-        return (line.length > 30 and orientation == "vertical") or line.is_dashed  # Doorsnede: vertical > 30pt OR dashed
+        return (line.length > 30 and orientation == "vertical") or line.is_dashed
     elif drawing_type == "bestektekening":
         label_lower = region_label.lower()
         if "grond" in label_lower or "verdieping" in label_lower:
-            return line.length > 50  # Plattegrond rules: lines > 50pt
+            return line.length > 50
         elif "gevel" in label_lower:
-            return line.length > 40  # Gevel rules: lines > 40pt
+            return line.length > 40
         elif "doorsnede" in label_lower:
-            return line.length > 30 and orientation == "vertical"  # Doorsnede rules: vertical > 30pt
+            return line.length > 30 and orientation == "vertical"
         else:
-            return line.length > 25  # Default: lines > 25pt
+            return line.length > 25
     elif drawing_type == "installatietekening":
-        return line.stroke_width <= 1 or line.is_dashed  # Installatie: thin lines OR dashed
-    else:  # unknown
-        return line.length > 10  # Unknown: lines > 10pt
+        return line.stroke_width <= 1 or line.is_dashed
+    else:
+        return line.length > 10
 
 def convert_vector_drawing_api_format(raw_vector_data: Dict) -> VectorData:
-    """Convert Vector Drawing API format to our internal format"""
+    """Convert Vector Drawing API format to our internal format with extensive debugging"""
     try:
         logger.info("=== Converting Vector Drawing API format ===")
+        logger.debug(f"Raw data keys: {list(raw_vector_data.keys())}")
         
         pages = raw_vector_data.get("pages", [])
         if not pages:
             raise ValueError("No pages found in vector data")
         
+        logger.info(f"Found {len(pages)} pages")
+        
         converted_pages = []
         
-        for page_data in pages:
-            page_size = page_data.get("page_size", {"width": 595.0, "height": 842.0})
+        for page_idx, page_data in enumerate(pages):
+            logger.debug(f"Page {page_idx} keys: {list(page_data.keys())}")
             
-            # Extract texts - direct format
+            page_size = page_data.get("page_size", {"width": 595.0, "height": 842.0})
+            logger.info(f"Page size: {page_size}")
+            
+            # Extract texts
             texts = []
-            for text_data in page_data.get("texts", []):
+            raw_texts = page_data.get("texts", [])
+            logger.info(f"Found {len(raw_texts)} texts")
+            
+            for i, text_data in enumerate(raw_texts[:3]):  # Log first 3
+                logger.debug(f"Text {i}: {text_data}")
+            
+            for text_data in raw_texts:
                 position = text_data.get("position", {"x": 0, "y": 0})
                 bbox = text_data.get("bbox", {})
                 
-                # Convert position to [x, y] format
                 if isinstance(position, dict):
                     pos_list = [float(position.get("x", 0)), float(position.get("y", 0))]
                 else:
                     pos_list = [float(position[0]), float(position[1])]
                 
-                # Convert bbox to [x1, y1, x2, y2] format  
                 if isinstance(bbox, dict):
                     bbox_list = [
                         float(bbox.get("x0", 0)), 
@@ -239,47 +259,82 @@ def convert_vector_drawing_api_format(raw_vector_data: Dict) -> VectorData:
                 )
                 texts.append(text)
             
-            # Extract lines from drawings
+            # Extract lines - THIS IS THE CRITICAL PART
             lines = []
+            
+            # Try multiple possible locations for lines
+            possible_line_locations = [
+                page_data.get("drawings", {}).get("lines", []),
+                page_data.get("lines", []),
+                page_data.get("paths", []),
+                page_data.get("elements", [])
+            ]
+            
+            # Also check if drawings is a list
             drawings = page_data.get("drawings", {})
+            if isinstance(drawings, list):
+                logger.info("Drawings is a list, not a dict!")
+                possible_line_locations.append(drawings)
             
-            logger.info(f"Drawings structure: {list(drawings.keys())}")
+            logger.info(f"Drawings type: {type(drawings)}")
+            if isinstance(drawings, dict):
+                logger.info(f"Drawings keys: {list(drawings.keys())}")
             
-            for line_data in drawings.get("lines", []):
-                logger.info(f"Processing line: {line_data}")
-                
-                # Handle Vector Drawing API format: {"type": "line", "p1": {"x": 100, "y": 200}, "p2": {"x": 300, "y": 400}, "length": 250}
-                p1 = line_data.get("p1", {"x": 0, "y": 0})
-                p2 = line_data.get("p2", {"x": 0, "y": 0})
-                
-                # Convert to [x, y] format
-                if isinstance(p1, dict):
-                    p1_list = [float(p1.get("x", 0)), float(p1.get("y", 0))]
-                else:
-                    p1_list = [float(p1[0]), float(p1[1])]
-                
-                if isinstance(p2, dict):
-                    p2_list = [float(p2.get("x", 0)), float(p2.get("y", 0))]
-                else:
-                    p2_list = [float(p2[0]), float(p2[1])]
-                
-                # Get other properties
-                length = float(line_data.get("length", 0))
-                width = float(line_data.get("width", 1.0))
-                color = line_data.get("color", [0, 0, 0])
-                
-                line = VectorLine(
-                    p1=p1_list,
-                    p2=p2_list,
-                    stroke_width=width,
-                    length=length,
-                    color=color,
-                    is_dashed=line_data.get("is_dashed", False),
-                    angle=line_data.get("angle")
-                )
-                lines.append(line)
-                
-                logger.info(f"Converted line: {p1_list} -> {p2_list}, length: {length}")
+            # Find lines in any of the possible locations
+            found_lines = False
+            for location_idx, line_list in enumerate(possible_line_locations):
+                if line_list:
+                    logger.info(f"Found {len(line_list)} lines in location {location_idx}")
+                    found_lines = True
+                    
+                    for i, line_data in enumerate(line_list[:5]):  # Log first 5
+                        logger.debug(f"Line {i}: {line_data}")
+                    
+                    for line_data in line_list:
+                        # Handle different line formats
+                        if isinstance(line_data, dict):
+                            # Check if it's a line
+                            if line_data.get("type") == "line" or "p1" in line_data:
+                                p1 = line_data.get("p1", {"x": 0, "y": 0})
+                                p2 = line_data.get("p2", {"x": 0, "y": 0})
+                                
+                                if isinstance(p1, dict):
+                                    p1_list = [float(p1.get("x", 0)), float(p1.get("y", 0))]
+                                else:
+                                    p1_list = [float(p1[0]), float(p1[1])]
+                                
+                                if isinstance(p2, dict):
+                                    p2_list = [float(p2.get("x", 0)), float(p2.get("y", 0))]
+                                else:
+                                    p2_list = [float(p2[0]), float(p2[1])]
+                                
+                                length = float(line_data.get("length", 0))
+                                if length == 0:
+                                    # Calculate length if not provided
+                                    dx = p2_list[0] - p1_list[0]
+                                    dy = p2_list[1] - p1_list[1]
+                                    length = math.sqrt(dx*dx + dy*dy)
+                                
+                                width = float(line_data.get("width", line_data.get("stroke_width", 1.0)))
+                                color = line_data.get("color", [0, 0, 0])
+                                
+                                line = VectorLine(
+                                    p1=p1_list,
+                                    p2=p2_list,
+                                    stroke_width=width,
+                                    length=length,
+                                    color=color,
+                                    is_dashed=line_data.get("is_dashed", False),
+                                    angle=line_data.get("angle")
+                                )
+                                lines.append(line)
+                    
+                    break  # Stop after finding lines in one location
+            
+            if not found_lines:
+                logger.warning("NO LINES FOUND IN ANY EXPECTED LOCATION!")
+                logger.info("Full page data structure:")
+                logger.info(json.dumps(page_data, indent=2, default=str)[:1000] + "...")
             
             page = VectorPage(
                 page_size=page_size,
@@ -298,10 +353,13 @@ def convert_vector_drawing_api_format(raw_vector_data: Dict) -> VectorData:
         
         logger.info(f"✅ Converted Vector Drawing API data: {total_lines} lines, {total_texts} texts")
         
+        if total_lines == 0:
+            logger.error("⚠️ WARNING: NO LINES FOUND AFTER CONVERSION!")
+        
         return result
         
     except Exception as e:
-        logger.error(f"Error converting Vector Drawing API format: {e}")
+        logger.error(f"Error converting Vector Drawing API format: {e}", exc_info=True)
         raise ValueError(f"Failed to convert Vector Drawing API format: {str(e)}")
 
 @app.post("/filter/", response_model=CleanOutput)
@@ -309,7 +367,6 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
     """Filter data and return clean, focused output per region"""
     
     try:
-        # Get first page data
         if not input_data.vector_data.pages:
             raise HTTPException(status_code=400, detail="No pages in vector_data")
         
@@ -317,44 +374,52 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
         drawing_type = input_data.vision_output.drawing_type
         regions = input_data.vision_output.regions
         
+        logger.info(f"=== FILTERING START ===")
         logger.info(f"Processing {drawing_type} with {len(regions)} regions")
         logger.info(f"Input: {len(vector_page.lines)} lines, {len(vector_page.texts)} texts")
         
-        # Log first few lines for debugging
-        if debug and vector_page.lines:
-            logger.info("Sample lines:")
+        if len(vector_page.lines) == 0:
+            logger.error("NO LINES IN INPUT DATA!")
+        
+        # Log first few lines and regions for debugging
+        if vector_page.lines:
+            logger.info("First 3 lines:")
             for i, line in enumerate(vector_page.lines[:3]):
-                logger.info(f"  Line {i}: p1={line.p1}, p2={line.p2}, length={line.length}")
+                logger.info(f"  Line {i}: [{line.p1[0]:.1f},{line.p1[1]:.1f}] -> [{line.p2[0]:.1f},{line.p2[1]:.1f}], length={line.length:.1f}")
+        
+        logger.info("Regions:")
+        for region in regions:
+            logger.info(f"  {region.label}: {region.coordinate_block}")
         
         region_outputs = []
-        total_lines_processed = 0
+        total_lines_checked = 0
+        total_lines_in_regions = 0
+        total_lines_included = 0
         
         for region in regions:
             region_lines = []
             region_texts = []
-            lines_in_region = 0
+            lines_in_this_region = 0
             
-            logger.info(f"Processing region: {region.label}")
+            logger.info(f"\nProcessing region: {region.label}")
             logger.info(f"  Region bounds: {region.coordinate_block}")
             
             # Process lines for this region
             for i, line in enumerate(vector_page.lines):
+                total_lines_checked += 1
+                
                 # Check if line is in region
                 is_in_region = line_intersects_region(line.p1, line.p2, region.coordinate_block)
                 
-                if debug and i < 5:  # Debug first 5 lines
-                    logger.info(f"  Line {i}: {line.p1} -> {line.p2}, in_region: {is_in_region}")
-                
                 if is_in_region:
-                    lines_in_region += 1
+                    lines_in_this_region += 1
+                    total_lines_in_regions += 1
                     
                     # Check if line should be included based on rules
                     should_include = should_include_line(line, drawing_type, region.label)
                     
-                    if debug and lines_in_region <= 3:
-                        logger.info(f"    Should include: {should_include} (type: {drawing_type}, length: {line.length})")
-                    
                     if should_include:
+                        total_lines_included += 1
                         clean_line = CleanLine(
                             p1=CleanPoint(x=round(line.p1[0], 1), y=round(line.p1[1], 1)),
                             p2=CleanPoint(x=round(line.p2[0], 1), y=round(line.p2[1], 1)),
@@ -364,11 +429,11 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
                         )
                         region_lines.append(clean_line)
             
-            total_lines_processed += lines_in_region
-            
             # Process texts for this region
+            texts_in_region = 0
             for text in vector_page.texts:
                 if text_in_region(text, region.coordinate_block):
+                    texts_in_region += 1
                     clean_text = CleanText(
                         text=text.text,
                         position=CleanPoint(x=round(text.position[0], 1), y=round(text.position[1], 1)),
@@ -384,32 +449,34 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
             )
             region_outputs.append(region_data)
             
-            logger.info(f"  {region.label}: {len(region_lines)} lines (from {lines_in_region} in region), {len(region_texts)} texts")
+            logger.info(f"  {region.label} results:")
+            logger.info(f"    Lines in region: {lines_in_this_region}")
+            logger.info(f"    Lines included: {len(region_lines)}")
+            logger.info(f"    Texts in region: {texts_in_region}")
         
-        # Create clean output - NO unassigned data, NO metadata
+        # Create clean output
         output = CleanOutput(
             drawing_type=drawing_type,
             regions=region_outputs
         )
         
-        total_lines = sum(len(r.lines) for r in region_outputs)
-        total_texts = sum(len(r.texts) for r in region_outputs)
+        logger.info(f"\n=== FILTERING COMPLETE ===")
+        logger.info(f"Total lines checked: {total_lines_checked}")
+        logger.info(f"Total lines in any region: {total_lines_in_regions}")
+        logger.info(f"Total lines included: {total_lines_included}")
+        logger.info(f"Total texts: {sum(len(r.texts) for r in region_outputs)}")
         
-        logger.info(f"✅ Clean filtering completed:")
-        logger.info(f"  Total lines found in regions: {total_lines_processed}")
-        logger.info(f"  Total lines included: {total_lines}")
-        logger.info(f"  Total texts: {total_texts}")
-        logger.info(f"  Regions: {len(region_outputs)}")
-        
-        if total_lines == 0:
-            logger.warning("⚠️  NO LINES FOUND! This suggests a coordinate system or intersection problem.")
+        if total_lines_included == 0:
+            logger.error("⚠️ NO LINES INCLUDED IN OUTPUT!")
+            logger.error("Possible issues:")
+            logger.error("1. No lines in input data")
+            logger.error("2. Region coordinates don't match line coordinates")
+            logger.error("3. All lines filtered out by length requirements")
         
         return output
     
-    except HTTPException as e:
-        raise e
     except Exception as e:
-        logger.error(f"Error: {str(e)}", exc_info=True)
+        logger.error(f"Error in filter_clean: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/filter-from-vector-api/", response_model=CleanOutput)
@@ -447,35 +514,25 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "Clean Filter API - Vector Drawing API Compatible",
-        "version": "3.1.0"
+        "service": "Debug Filter API",
+        "version": "3.2.0-debug"
     }
 
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
-        "title": "Clean Filter API - Vector Drawing API Compatible",
-        "version": "3.1.0",
-        "description": "Returns clean, focused output per region - works with Vector Drawing API format",
-        "features": [
-            "Compatible with Vector Drawing API format",
-            "Clean output per region only",
-            "No unassigned data", 
-            "Correct length filtering per drawing type",
-            "Processes p1/p2 as {x,y} objects or [x,y] arrays"
+        "title": "Debug Filter API",
+        "version": "3.2.0-debug",
+        "description": "Debug version to find why no lines are returned",
+        "debug_features": [
+            "Extensive logging of line processing",
+            "Multiple line location checks",
+            "Detailed intersection debugging",
+            "Line count tracking at each stage"
         ],
-        "drawing_types": {
-            "plattegrond": "Lines > 50pt",
-            "gevelaanzicht": "Lines > 40pt",
-            "detailtekening": "Lines > 25pt", 
-            "doorsnede": "Vertical lines > 30pt OR dashed lines",
-            "bestektekening": "Region-specific rules",
-            "installatietekening": "Lines ≤ 1pt stroke OR dashed",
-            "unknown": "Lines > 10pt"
-        },
         "endpoints": {
-            "/filter/": "Main filtering endpoint (requires converted format)",
+            "/filter/": "Main filtering endpoint",
             "/filter-from-vector-api/": "Direct endpoint for Vector Drawing API output",
             "/health": "Health check"
         }
