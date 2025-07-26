@@ -137,30 +137,7 @@ def calculate_text_orientation(bbox: List[float]) -> str:
     """Calculate text orientation based on bounding box dimensions"""
     width = abs(bbox[2] - bbox[0])
     height = abs(bbox[3] - bbox[1])
-    return "vertical" if width >= height else "horizontal"  
-
-def is_valid_dimension(text: str) -> bool:
-    """
-    Validate if text represents a pure dimension (numbers with optional units).
-    Excludes texts with letters, symbols, or non-dimensional content.
-    """
-    if not text or not text.strip():
-        return False
-    
-    text_clean = text.strip()
-    
-    # Pattern for valid dimensions: pure numbers with optional units
-    # Matches: "3000", "3000mm", "3,5 m", "250 cm", "3.5m"
-    pattern = r'^\d+([,.]\d+)?\s*(mm|cm|m)?$'
-    
-    is_valid = bool(re.match(pattern, text_clean))
-    
-    if is_valid:
-        logger.debug(f"Valid dimension text: '{text_clean}'")
-    else:
-        logger.debug(f"Invalid dimension text: '{text_clean}' (contains letters/symbols or invalid format)")
-    
-    return is_valid
+    return "vertical" if width >= height else "horizontal"
 
 def extract_dimension_value(text: str) -> Optional[float]:
     """
@@ -185,6 +162,53 @@ def extract_dimension_value(text: str) -> Optional[float]:
             return value  # Assume mm if no unit
     
     return None
+
+def is_valid_dimension(text: str, drawing_type: str = "general") -> bool:
+    """
+    Validate if text represents a pure dimension (numbers with optional units).
+    Excludes texts with letters, symbols, or non-dimensional content.
+    For plattegrond: only values ≥1000 (mm) to avoid noise from small numbers.
+    """
+    if not text or not text.strip():
+        return False
+    
+    text_clean = text.strip()
+    
+    # Pattern for valid dimensions: pure numbers with optional units
+    # Matches: "3000", "3000mm", "3,5 m", "250 cm", "3.5m"
+    pattern = r'^\d+([,.]\d+)?\s*(mm|cm|m)?$'
+    
+    is_valid = bool(re.match(pattern, text_clean))
+    
+    if not is_valid:
+        logger.debug(f"Invalid dimension text: '{text_clean}' (contains letters/symbols or invalid format)")
+        return False
+    
+    # Extract numeric value to check minimum threshold
+    extracted_value = extract_dimension_value(text_clean)
+    if extracted_value is None:
+        logger.debug(f"Could not extract numeric value from: '{text_clean}'")
+        return False
+    
+    # Apply drawing-type specific minimum thresholds
+    if drawing_type == "plattegrond":
+        # For plattegrond: minimum 1000mm to filter out noise like "3", "10", "12"
+        min_value = 1000
+        if extracted_value < min_value:
+            logger.debug(f"Plattegrond filter: '{text_clean}' = {extracted_value}mm < {min_value}mm = excluded")
+            return False
+        else:
+            logger.debug(f"Valid plattegrond dimension: '{text_clean}' = {extracted_value}mm >= {min_value}mm")
+            return True
+    else:
+        # For other drawing types: minimum 100mm (existing behavior)
+        min_value = 100
+        if extracted_value < min_value:
+            logger.debug(f"General filter: '{text_clean}' = {extracted_value}mm < {min_value}mm = excluded")
+            return False
+        else:
+            logger.debug(f"Valid dimension: '{text_clean}' = {extracted_value}mm >= {min_value}mm")
+            return True
 
 def line_intersects_region(line_p1: List[float], line_p2: List[float], region: List[float]) -> bool:
     """Check if line intersects with region"""
@@ -253,15 +277,15 @@ def should_include_line(line: VectorLine, drawing_type: str, region_label: str) 
         return line.length > 10
 
 def should_include_text(text: VectorText, drawing_type: str, region_label: str) -> bool:
-    """Determine if text should be included - prioritize valid dimensions"""
+    """Determine if text should be included - prioritize valid dimensions with drawing-type specific rules"""
     
-    # For all drawing types, only include valid dimension texts
-    is_valid = is_valid_dimension(text.text)
+    # Pass drawing_type to dimension validation for specific filtering rules
+    is_valid = is_valid_dimension(text.text, drawing_type)
     
     if is_valid:
-        logger.debug(f"Including valid dimension text: '{text.text}'")
+        logger.debug(f"Including valid dimension text: '{text.text}' for {drawing_type}")
     else:
-        logger.debug(f"Excluding invalid dimension text: '{text.text}'")
+        logger.debug(f"Excluding invalid dimension text: '{text.text}' for {drawing_type}")
     
     return is_valid
 
@@ -576,6 +600,7 @@ async def root():
         ],
         "filtering_features": [
             "Plattegrond-specific preprocessing (≥100pt, horizontal/vertical)",
+            "Enhanced dimension filtering (≥1000mm for plattegrond)",
             "Duplicate line removal",
             "Pure dimension text validation (no letters/symbols)",
             "Regional boundary checking"
