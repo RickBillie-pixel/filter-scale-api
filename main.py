@@ -101,9 +101,9 @@ def calculate_orientation(p1: List[float], p2: List[float], angle: Optional[floa
     if angle is not None:
         normalized_angle = abs(angle % 180)
         if normalized_angle < 15 or normalized_angle > 165:
-            return "horizontal"
-        elif 75 < normalized_angle < 105:
             return "vertical"
+        elif 75 < normalized_angle < 105:
+            return "horizontal"
         else:
             return "diagonal"
     else:
@@ -111,14 +111,14 @@ def calculate_orientation(p1: List[float], p2: List[float], angle: Optional[floa
         dy = abs(p2[1] - p1[1])
         
         if dx < 1:
-            return "vertical"
-        elif dy < 1:
             return "horizontal"
+        elif dy < 1:
+            return "vertical"
         else:
             angle_rad = math.atan2(dy, dx)
             angle_deg = math.degrees(angle_rad)
             if angle_deg < 15 or angle_deg > 165:
-                return "horizontal"
+                return "vertical"
             elif 75 < angle_deg < 105:
                 return "vertical"
             else:
