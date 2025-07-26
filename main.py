@@ -81,10 +81,7 @@ class FilteredText(BaseModel):
     text: str
     midpoint: Dict[str, float]
     orientation: str
-    # Optional fields only included in debug mode
-    position: Optional[Dict[str, float]] = None
-    bounding_box: Optional[List[float]] = None
-
+    
 class RegionData(BaseModel):
     label: str
     lines: List[FilteredLine]
@@ -125,15 +122,15 @@ def calculate_orientation(p1: List[float], p2: List[float], angle: Optional[floa
 def calculate_midpoint(p1: List[float], p2: List[float]) -> CleanPoint:
     """Calculate midpoint of a line"""
     return CleanPoint(
-        x=round((p1[0] + p2[0]) / 2, 1),
-        y=round((p1[1] + p2[1]) / 2, 1)
+        x=round((p1[0] + p2[0]) / 2,
+        y=round((p1[1] + p2[1]) / 2 
     )
 
 def calculate_text_midpoint(bbox: List[float]) -> Dict[str, float]:
     """Calculate midpoint of text bounding box"""
     return {
-        "x": round((bbox[0] + bbox[2]) / 2, 1),
-        "y": round((bbox[1] + bbox[3]) / 2, 1)
+        "x": round((bbox[0] + bbox[2]) / 2,
+        "y": round((bbox[1] + bbox[3]) / 2
     }
 
 def calculate_text_orientation(bbox: List[float]) -> str:
