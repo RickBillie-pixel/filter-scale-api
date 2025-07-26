@@ -142,7 +142,7 @@ def calculate_text_orientation(bbox: List[float]) -> str:
     """Calculate text orientation based on bounding box dimensions"""
     width = abs(bbox[2] - bbox[0])
     height = abs(bbox[3] - bbox[1])
-    return "horizontal" if width >= height else "vertical"
+    return "vertical" if width >= height else "horizontal"  
 
 def is_valid_dimension(text: str) -> bool:
     """
