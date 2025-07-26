@@ -118,7 +118,7 @@ def calculate_orientation(p1: List[float], p2: List[float], angle: Optional[floa
             if angle_deg < 15 or angle_deg > 165:
                 return "vertical"
             elif 75 < angle_deg < 105:
-                return "horizontal"  # ← FIX: was "vertical"
+                return "horizontal"
             else:
                 return "diagonal"
 
@@ -470,16 +470,16 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
             logger.info(f"\nProcessing region: {region.label}")
             
             # Process lines for this region
-for line in processed_lines:
-    if line_intersects_region(line.p1, line.p2, region.coordinate_block):
-        if should_include_line(line, drawing_type, region.label):
-            total_lines_included += 1
-            filtered_line = FilteredLine(
-                length=line.length,
-                orientation=calculate_orientation(line.p1, line.p2, line.angle),
-                midpoint=calculate_midpoint(line.p1, line.p2)
-            )
-            region_lines.append(filtered_line)
+            for line in processed_lines:
+                if line_intersects_region(line.p1, line.p2, region.coordinate_block):
+                    if should_include_line(line, drawing_type, region.label):
+                        total_lines_included += 1
+                        filtered_line = FilteredLine(
+                            length=line.length,
+                            orientation=calculate_orientation(line.p1, line.p2, line.angle),
+                            midpoint=calculate_midpoint(line.p1, line.p2)
+                        )
+                        region_lines.append(filtered_line)
             
             # Process texts for this region - ONLY VALID DIMENSIONS
             for text in vector_page.texts:
@@ -493,7 +493,6 @@ for line in processed_lines:
                             midpoint=calculate_text_midpoint(text.bounding_box),
                             orientation=calculate_text_orientation(text.bounding_box)
                         )
-                        
                         
                         region_texts.append(filtered_text)
             
