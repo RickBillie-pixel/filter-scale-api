@@ -73,8 +73,6 @@ class CleanPoint(BaseModel):
     y: float
 
 class FilteredLine(BaseModel):
-    p1: CleanPoint
-    p2: CleanPoint
     length: float
     orientation: str
     midpoint: CleanPoint
@@ -120,7 +118,7 @@ def calculate_orientation(p1: List[float], p2: List[float], angle: Optional[floa
             if angle_deg < 15 or angle_deg > 165:
                 return "vertical"
             elif 75 < angle_deg < 105:
-                return "vertical"
+                return "horizontal"  # ← FIX: was "vertical"
             else:
                 return "diagonal"
 
@@ -472,18 +470,16 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
             logger.info(f"\nProcessing region: {region.label}")
             
             # Process lines for this region
-            for line in processed_lines:
-                if line_intersects_region(line.p1, line.p2, region.coordinate_block):
-                    if should_include_line(line, drawing_type, region.label):
-                        total_lines_included += 1
-                        filtered_line = FilteredLine(
-                            p1=CleanPoint(x=round(line.p1[0], 1), y=round(line.p1[1], 1)),
-                            p2=CleanPoint(x=round(line.p2[0], 1), y=round(line.p2[1], 1)),
-                            length=round(line.length, 1),
-                            orientation=calculate_orientation(line.p1, line.p2, line.angle),
-                            midpoint=calculate_midpoint(line.p1, line.p2)
-                        )
-                        region_lines.append(filtered_line)
+for line in processed_lines:
+    if line_intersects_region(line.p1, line.p2, region.coordinate_block):
+        if should_include_line(line, drawing_type, region.label):
+            total_lines_included += 1
+            filtered_line = FilteredLine(
+                length=line.length,
+                orientation=calculate_orientation(line.p1, line.p2, line.angle),
+                midpoint=calculate_midpoint(line.p1, line.p2)
+            )
+            region_lines.append(filtered_line)
             
             # Process texts for this region - ONLY VALID DIMENSIONS
             for text in vector_page.texts:
@@ -498,13 +494,6 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
                             orientation=calculate_text_orientation(text.bounding_box)
                         )
                         
-                        # Add debug fields only if debug=True
-                        if debug:
-                            filtered_text.position = {
-                                "x": round(text.position[0], 1), 
-                                "y": round(text.position[1], 1)
-                            }
-                            filtered_text.bounding_box = [round(x, 1) for x in text.bounding_box]
                         
                         region_texts.append(filtered_text)
             
