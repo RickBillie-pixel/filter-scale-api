@@ -15,9 +15,9 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(leve
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Filter API - Simplified Rules",
-    description="Simplified filtering: all orientations, no max length, 25pt buffer",
-    version="6.0.0-simplified"
+    title="Filter API v7.0.0 - Vision Compatible Bestektekening",
+    description="Updated for Vision's new bestektekening region format with drawing type classification",
+    version="7.0.0"
 )
 
 # CORS middleware
@@ -85,10 +85,61 @@ class RegionData(BaseModel):
     label: str
     lines: List[FilteredLine]
     texts: List[FilteredText]
+    parsed_drawing_type: Optional[str] = None  # NEW: Extracted drawing type for bestektekening
 
 class CleanOutput(BaseModel):
     drawing_type: str
     regions: List[RegionData]
+
+def parse_bestektekening_region_type(region_label: str) -> str:
+    """
+    Extract drawing type from bestektekening region label
+    Handles new Vision format: "Begane grond (plattegrond)" → "plattegrond"
+    """
+    
+    # Check for explicit type in parentheses first
+    if "(" in region_label and ")" in region_label:
+        try:
+            start = region_label.find("(") + 1
+            end = region_label.find(")")
+            extracted_type = region_label[start:end].strip()
+            
+            # Validate extracted type
+            valid_types = [
+                "plattegrond", "doorsnede", "gevelaanzicht", 
+                "detailtekening_kozijn", "detailtekening_plattegrond",
+                "detailtekening"
+            ]
+            
+            if extracted_type in valid_types:
+                logger.debug(f"Extracted drawing type '{extracted_type}' from label '{region_label}'")
+                return extracted_type
+                
+        except Exception as e:
+            logger.warning(f"Failed to parse parentheses in label '{region_label}': {e}")
+    
+    # Fallback to keyword matching (legacy compatibility)
+    label_lower = region_label.lower()
+    
+    if "plattegrond" in label_lower or "grond" in label_lower or "verdieping" in label_lower:
+        logger.debug(f"Fallback: detected plattegrond from '{region_label}'")
+        return "plattegrond"
+    elif "gevel" in label_lower or "aanzicht" in label_lower:
+        logger.debug(f"Fallback: detected gevelaanzicht from '{region_label}'")
+        return "gevelaanzicht"
+    elif "doorsnede" in label_lower:
+        logger.debug(f"Fallback: detected doorsnede from '{region_label}'")
+        return "doorsnede"
+    elif "detail" in label_lower:
+        if "kozijn" in label_lower or "raam" in label_lower or "deur" in label_lower:
+            logger.debug(f"Fallback: detected detailtekening_kozijn from '{region_label}'")
+            return "detailtekening_kozijn"
+        else:
+            logger.debug(f"Fallback: detected detailtekening (generic) from '{region_label}'")
+            return "detailtekening"
+    else:
+        logger.debug(f"No drawing type detected from '{region_label}', using unknown")
+        return "unknown"
 
 def calculate_orientation(p1: List[float], p2: List[float], angle: Optional[float] = None) -> str:
     """Calculate line orientation"""
@@ -205,7 +256,7 @@ def is_valid_dimension(text: str, drawing_type: str = "general") -> bool:
 def line_intersects_region(line_p1: List[float], line_p2: List[float], region: List[float]) -> bool:
     """Check if line intersects with expanded region (25pt buffer)"""
     x1, y1, x2, y2 = region
-    # UPDATED: 25pt buffer for lines (was 20pt for text only)
+    # 25pt buffer for lines
     expanded_region = [x1 - 25, y1 - 25, x2 + 25, y2 + 25]
     
     # Method 1: Check if any endpoint is in expanded region
@@ -237,7 +288,7 @@ def line_intersects_region(line_p1: List[float], line_p2: List[float], region: L
 
 def text_overlaps_region(text: VectorText, region: List[float]) -> bool:
     """Check if text bounding box overlaps with expanded region (25pt buffer)"""
-    # UPDATED: 25pt buffer (was 20pt)
+    # 25pt buffer
     x1, y1, x2, y2 = region
     expanded_region = [x1 - 25, y1 - 25, x2 + 25, y2 + 25]
     
@@ -251,54 +302,73 @@ def text_overlaps_region(text: VectorText, region: List[float]) -> bool:
                 text_y1 > expanded_region[3])    # text is above region
 
 def should_include_line(line: VectorLine, drawing_type: str, region_label: str) -> bool:
-    """SIMPLIFIED: Vaste regels per drawing type - alle oriëntaties, geen max lengte"""
+    """
+    UPDATED v7.0.0: Enhanced filtering rules with bestektekening region parsing
+    """
     
-    # PLATTEGROND: Dunne lijnen ≥50pt (alle richtingen)
-    if drawing_type == "plattegrond":
+    # Handle bestektekening with new Vision format
+    if drawing_type == "bestektekening":
+        region_drawing_type = parse_bestektekening_region_type(region_label)
+        logger.debug(f"Bestektekening region '{region_label}' parsed as '{region_drawing_type}'")
+        
+        # Apply rules for the parsed drawing type
+        if region_drawing_type == "plattegrond":
+            return (line.stroke_width <= 1.5 and line.length >= 50) or line.is_dashed
+        elif region_drawing_type == "gevelaanzicht":
+            return (line.stroke_width <= 1.5 and line.length >= 40) or line.is_dashed
+        elif region_drawing_type == "doorsnede":
+            return (line.stroke_width <= 1.5 and line.length >= 40) or line.is_dashed
+        elif region_drawing_type in ["detailtekening_kozijn", "detailtekening_plattegrond", "detailtekening"]:
+            return (line.stroke_width <= 1.0 and line.length >= 20) or line.is_dashed
+        else:
+            # Unknown region type - use conservative default
+            logger.warning(f"Unknown region type '{region_drawing_type}' for bestektekening, using default rules")
+            return (line.stroke_width <= 1.5 and line.length >= 30) or line.is_dashed
+    
+    # Standard drawing type rules (unchanged)
+    elif drawing_type == "plattegrond":
         return (line.stroke_width <= 1.5 and line.length >= 50) or line.is_dashed
     
-    # GEVELAANZICHT: Dunne lijnen ≥40pt (alle richtingen)
     elif drawing_type == "gevelaanzicht":
         return (line.stroke_width <= 1.5 and line.length >= 40) or line.is_dashed
     
-    # DOORSNEDE: Dunne lijnen ≥40pt (alle richtingen)
     elif drawing_type == "doorsnede":
         return (line.stroke_width <= 1.5 and line.length >= 40) or line.is_dashed
     
-    # DETAILTEKENING: Zeer dunne lijnen ≥20pt (alle richtingen)
-    elif drawing_type == "detailtekening":
+    elif drawing_type in ["detailtekening", "detailtekening_kozijn", "detailtekening_plattegrond"]:
         return (line.stroke_width <= 1.0 and line.length >= 20) or line.is_dashed
     
-    # INSTALLATIETEKENING: Zeer dunne lijnen ≥30pt (alle richtingen)
     elif drawing_type == "installatietekening":
-        return (line.stroke_width <= 1.0 and line.length >= 30) or line.is_dashed
+        # Skip installatietekening (no processing)
+        return False
     
-    # BESTEKTEKENING: Afhankelijk van regio (alle richtingen)
-    elif drawing_type == "bestektekening":
-        label_lower = region_label.lower()
-        if "grond" in label_lower or "verdieping" in label_lower:
-            return (line.stroke_width <= 1.5 and line.length >= 50) or line.is_dashed
-        elif "gevel" in label_lower:
-            return (line.stroke_width <= 1.5 and line.length >= 40) or line.is_dashed
-        elif "doorsnede" in label_lower:
-            return (line.stroke_width <= 1.5 and line.length >= 40) or line.is_dashed
-        else:
-            return (line.stroke_width <= 1.0 and line.length >= 20) or line.is_dashed
-    
-    # DEFAULT: Conservatief (alle richtingen)
     else:
+        # Default: Conservative rules
         return (line.stroke_width <= 1.5 and line.length >= 30) or line.is_dashed
 
 def should_include_text(text: VectorText, drawing_type: str, region_label: str) -> bool:
-    """Determine if text should be included - prioritize valid dimensions with drawing-type specific rules"""
+    """
+    UPDATED v7.0.0: Enhanced text filtering with bestektekening region parsing
+    """
     
-    # Pass drawing_type to dimension validation for specific filtering rules
-    is_valid = is_valid_dimension(text.text, drawing_type)
+    # Handle bestektekening with region-specific rules
+    if drawing_type == "bestektekening":
+        region_drawing_type = parse_bestektekening_region_type(region_label)
+        effective_drawing_type = region_drawing_type
+    else:
+        effective_drawing_type = drawing_type
+    
+    # Skip installatietekening
+    if effective_drawing_type == "installatietekening":
+        return False
+    
+    # Apply dimension validation
+    is_valid = is_valid_dimension(text.text, effective_drawing_type)
     
     if is_valid:
-        logger.debug(f"Including valid dimension text: '{text.text}' for {drawing_type}")
+        logger.debug(f"Including valid dimension text: '{text.text}' for {effective_drawing_type}")
     else:
-        logger.debug(f"Excluding invalid dimension text: '{text.text}' for {drawing_type}")
+        logger.debug(f"Excluding invalid dimension text: '{text.text}' for {effective_drawing_type}")
     
     return is_valid
 
@@ -467,11 +537,16 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
         drawing_type = input_data.vision_output.drawing_type
         regions = input_data.vision_output.regions
         
-        logger.info(f"=== FILTERING START (Simplified Rules v6.0.0) ===")
+        logger.info(f"=== FILTERING START (v7.0.0 - Vision Compatible) ===")
         logger.info(f"Processing {drawing_type} with {len(regions)} regions")
         logger.info(f"Input: {len(vector_page.lines)} lines, {len(vector_page.texts)} texts")
         logger.info(f"Debug mode: {debug}")
         logger.info(f"25pt buffer applied to all regions")
+        
+        # Skip installatietekening entirely
+        if drawing_type == "installatietekening":
+            logger.info("Skipping installatietekening - no processing")
+            return CleanOutput(drawing_type=drawing_type, regions=[])
         
         # Apply plattegrond-specific preprocessing (duplicate removal only)
         processed_lines = vector_page.lines
@@ -489,6 +564,12 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
             region_texts = []
             
             logger.info(f"\nProcessing region: {region.label}")
+            
+            # NEW v7.0.0: Parse drawing type for bestektekening regions
+            parsed_drawing_type = None
+            if drawing_type == "bestektekening":
+                parsed_drawing_type = parse_bestektekening_region_type(region.label)
+                logger.info(f"  Parsed drawing type: {parsed_drawing_type}")
             
             # Process lines for this region
             for line in processed_lines:
@@ -524,17 +605,20 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
                     elif debug:
                         logger.debug(f"  ❌ Text excluded: '{text.text}'")
             
-            # Create region output
+            # Create region output with parsed drawing type
             region_data = RegionData(
                 label=region.label,
                 lines=region_lines,
-                texts=region_texts
+                texts=region_texts,
+                parsed_drawing_type=parsed_drawing_type  # NEW: For Scale API compatibility
             )
             region_outputs.append(region_data)
             
             logger.info(f"  {region.label} results:")
             logger.info(f"    Lines included: {len(region_lines)}")
             logger.info(f"    Valid dimension texts: {len(region_texts)}")
+            if parsed_drawing_type:
+                logger.info(f"    Parsed drawing type: {parsed_drawing_type}")
         
         # Create clean output
         output = CleanOutput(
@@ -587,31 +671,60 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "Filter API - Simplified Rules",
-        "version": "6.0.0-simplified"
+        "service": "Filter API v7.0.0 - Vision Compatible",
+        "version": "7.0.0",
+        "timestamp": datetime.now().isoformat()
     }
 
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
-        "title": "Filter API - Simplified Rules",
-        "version": "6.0.0-simplified",
-        "description": "Simplified filtering: all orientations, no max length, 25pt buffer",
-        "simplified_features": [
-            "✅ All orientations allowed (H/V/diagonal)",
-            "✅ No maximum length restrictions", 
-            "✅ 25pt buffer for both lines and text",
-            "✅ Only stroke width + min length filtering",
-            "✅ Dashed lines always included"
+        "title": "Filter API v7.0.0 - Vision Compatible Bestektekening",
+        "version": "7.0.0",
+        "description": "Updated for Vision's new bestektekening region format with drawing type classification",
+        "new_features_v7": [
+            "✅ Parses drawing types from Vision region labels",
+            "✅ Handles new bestektekening format: 'Begane grond (plattegrond)'",
+            "✅ Fallback to keyword matching for legacy compatibility",
+            "✅ Adds parsed_drawing_type field to RegionData for Scale API",
+            "✅ Enhanced logging for bestektekening region processing",
+            "✅ Installatietekening completely skipped"
         ],
+        "parsing_examples": {
+            "new_format": {
+                "input": "Begane grond (plattegrond)",
+                "extracted": "plattegrond",
+                "rules_applied": "plattegrond filtering rules"
+            },
+            "legacy_format": {
+                "input": "Eerste verdieping",
+                "fallback": "plattegrond (keyword: verdieping)",
+                "rules_applied": "plattegrond filtering rules"
+            },
+            "unknown_format": {
+                "input": "Onbekende regio",
+                "fallback": "unknown",
+                "rules_applied": "default conservative rules"
+            }
+        },
+        "bestektekening_region_rules": {
+            "plattegrond": "stroke ≤1.5pt, length ≥50pt",
+            "gevelaanzicht": "stroke ≤1.5pt, length ≥40pt",
+            "doorsnede": "stroke ≤1.5pt, length ≥40pt", 
+            "detailtekening_kozijn": "stroke ≤1.0pt, length ≥20pt",
+            "detailtekening_plattegrond": "stroke ≤1.0pt, length ≥20pt",
+            "unknown": "stroke ≤1.5pt, length ≥30pt (conservative)"
+        },
         "filtering_rules": {
             "plattegrond": "stroke ≤1.5pt, length ≥50pt",
             "gevelaanzicht": "stroke ≤1.5pt, length ≥40pt", 
             "doorsnede": "stroke ≤1.5pt, length ≥40pt",
             "detailtekening": "stroke ≤1.0pt, length ≥20pt",
-            "installatietekening": "stroke ≤1.0pt, length ≥30pt",
-            "bestektekening": "context-dependent rules",
+            "detailtekening_kozijn": "stroke ≤1.0pt, length ≥20pt",
+            "detailtekening_plattegrond": "stroke ≤1.0pt, length ≥20pt",
+            "bestektekening": "per_region_rules based on parsed drawing type",
+            "installatietekening": "SKIPPED - no processing",
             "default": "stroke ≤1.5pt, length ≥30pt"
         },
         "text_filtering": {
@@ -620,16 +733,51 @@ async def root():
             "minimum_values": {
                 "plattegrond": "500mm",
                 "other": "100mm"
-            }
+            },
+            "bestektekening": "Uses parsed region drawing type for validation"
         },
+        "output_enhancements": {
+            "parsed_drawing_type": "Added to RegionData for bestektekening regions",
+            "scale_api_compatibility": "Ready for Scale API v7.0.0",
+            "debug_logging": "Enhanced region processing visibility"
+        },
+        "compatibility": {
+            "filter_api_v6": "Backward compatible with existing API calls",
+            "scale_api_v7": "Forward compatible with new parsed_drawing_type field",
+            "master_api": "Works with existing Master API v4.1.0"
+        },
+        "technical_specifications": {
+            "buffer_size": "25pt for both lines and texts",
+            "orientation_detection": "Horizontal, vertical, diagonal",
+            "duplicate_removal": "For plattegrond only (1pt tolerance)",
+            "region_intersection": "Shapely-based geometric intersection",
+            "coordinate_formats": "Supports both dict and list formats"
+        },
+        "api_workflow": [
+            "1. Receive Vector data (lines/texts) and Vision output (regions)",
+            "2. Parse bestektekening region labels to extract drawing types",
+            "3. Apply 25pt buffer expansion to all regions",
+            "4. Filter lines based on stroke width and length per drawing type",
+            "5. Filter texts to only include valid dimensions with units",
+            "6. Calculate orientations and midpoints for all filtered elements",
+            "7. Return clean output with parsed_drawing_type for Scale API"
+        ],
         "endpoints": {
             "/filter/": "Main filtering endpoint (add ?debug=true for detailed output)",
             "/filter-from-vector-api/": "Direct endpoint for Vector Drawing API output",
-            "/health": "Health check"
+            "/health": "Health check with timestamp",
+            "/": "This documentation endpoint"
+        },
+        "logging_levels": {
+            "INFO": "High-level processing steps and results",
+            "DEBUG": "Detailed line/text inclusion/exclusion decisions",
+            "WARNING": "Parsing failures and fallback usage",
+            "ERROR": "Processing errors and exceptions"
         }
     }
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
+    logger.info(f"Starting Filter API v7.0.0 on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
