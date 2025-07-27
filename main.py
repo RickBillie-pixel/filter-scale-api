@@ -15,9 +15,9 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(leve
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Filter API - Scale API Compatible",
-    description="Optimized for Scale API with flexible region boundaries and text overlap detection",
-    version="5.0.0-flexible"
+    title="Filter API - Simplified Rules",
+    description="Simplified filtering: all orientations, no max length, 25pt buffer",
+    version="6.0.0-simplified"
 )
 
 # CORS middleware
@@ -80,7 +80,6 @@ class FilteredLine(BaseModel):
 class FilteredText(BaseModel):
     text: str
     midpoint: Dict[str, float]
-    # Removed orientation - not used by Scale API
     
 class RegionData(BaseModel):
     label: str
@@ -161,7 +160,6 @@ def is_valid_dimension(text: str, drawing_type: str = "general") -> bool:
     """
     Validate if text represents a pure dimension (numbers with optional units).
     Excludes texts with letters, symbols, or non-dimensional content.
-    Lowered thresholds for more flexibility.
     """
     if not text or not text.strip():
         return False
@@ -184,9 +182,9 @@ def is_valid_dimension(text: str, drawing_type: str = "general") -> bool:
         logger.debug(f"Could not extract numeric value from: '{text_clean}'")
         return False
     
-    # Apply drawing-type specific minimum thresholds - LOWERED FOR FLEXIBILITY
+    # Apply drawing-type specific minimum thresholds
     if drawing_type == "plattegrond":
-        # For plattegrond: minimum 500mm (was 1000mm)
+        # For plattegrond: minimum 500mm
         min_value = 500
         if extracted_value < min_value:
             logger.debug(f"Plattegrond filter: '{text_clean}' = {extracted_value}mm < {min_value}mm = excluded")
@@ -195,7 +193,7 @@ def is_valid_dimension(text: str, drawing_type: str = "general") -> bool:
             logger.debug(f"Valid plattegrond dimension: '{text_clean}' = {extracted_value}mm >= {min_value}mm")
             return True
     else:
-        # For other drawing types: minimum 100mm (unchanged)
+        # For other drawing types: minimum 100mm
         min_value = 100
         if extracted_value < min_value:
             logger.debug(f"General filter: '{text_clean}' = {extracted_value}mm < {min_value}mm = excluded")
@@ -205,15 +203,17 @@ def is_valid_dimension(text: str, drawing_type: str = "general") -> bool:
             return True
 
 def line_intersects_region(line_p1: List[float], line_p2: List[float], region: List[float]) -> bool:
-    """Check if line intersects with region"""
+    """Check if line intersects with expanded region (25pt buffer)"""
     x1, y1, x2, y2 = region
+    # UPDATED: 25pt buffer for lines (was 20pt for text only)
+    expanded_region = [x1 - 25, y1 - 25, x2 + 25, y2 + 25]
     
-    # Method 1: Check if any endpoint is in region
+    # Method 1: Check if any endpoint is in expanded region
     for x, y in [line_p1, line_p2]:
-        if x1 <= x <= x2 and y1 <= y <= y2:
+        if expanded_region[0] <= x <= expanded_region[2] and expanded_region[1] <= y <= expanded_region[3]:
             return True
     
-    # Method 2: Check line bounds overlap with region
+    # Method 2: Check line bounds overlap with expanded region
     line_x1, line_y1 = line_p1
     line_x2, line_y2 = line_p2
     
@@ -223,23 +223,23 @@ def line_intersects_region(line_p1: List[float], line_p2: List[float], region: L
     line_max_y = max(line_y1, line_y2)
     
     # Check if bounding boxes overlap
-    if line_max_x < x1 or line_min_x > x2 or line_max_y < y1 or line_min_y > y2:
+    if line_max_x < expanded_region[0] or line_min_x > expanded_region[2] or line_max_y < expanded_region[1] or line_min_y > expanded_region[3]:
         return False
     
     # Method 3: Use Shapely for precise intersection
     try:
         line = LineString([line_p1, line_p2])
-        region_box = box(x1, y1, x2, y2)
+        region_box = box(expanded_region[0], expanded_region[1], expanded_region[2], expanded_region[3])
         return line.intersects(region_box)
     except Exception as e:
         logger.warning(f"Shapely intersection failed: {e}")
         return False
 
 def text_overlaps_region(text: VectorText, region: List[float]) -> bool:
-    """Check if text bounding box overlaps with expanded region"""
-    # Expand region boundaries by 20pt in all directions
+    """Check if text bounding box overlaps with expanded region (25pt buffer)"""
+    # UPDATED: 25pt buffer (was 20pt)
     x1, y1, x2, y2 = region
-    expanded_region = [x1 - 20, y1 - 20, x2 + 20, y2 + 20]
+    expanded_region = [x1 - 25, y1 - 25, x2 + 25, y2 + 25]
     
     # Text bounding box
     text_x1, text_y1, text_x2, text_y2 = text.bounding_box
@@ -251,32 +251,43 @@ def text_overlaps_region(text: VectorText, region: List[float]) -> bool:
                 text_y1 > expanded_region[3])    # text is above region
 
 def should_include_line(line: VectorLine, drawing_type: str, region_label: str) -> bool:
-    """Determine if line should be included based on drawing type and region"""
-    orientation = calculate_orientation(line.p1, line.p2, line.angle)
+    """SIMPLIFIED: Vaste regels per drawing type - alle oriëntaties, geen max lengte"""
     
+    # PLATTEGROND: Dunne lijnen ≥50pt (alle richtingen)
     if drawing_type == "plattegrond":
-        # Plattegrond rules: length ≥100pt and only horizontal/vertical
-        return line.length >= 100 and orientation in ["horizontal", "vertical"]
+        return (line.stroke_width <= 1.5 and line.length >= 50) or line.is_dashed
+    
+    # GEVELAANZICHT: Dunne lijnen ≥40pt (alle richtingen)
     elif drawing_type == "gevelaanzicht":
-        return line.length > 40
-    elif drawing_type == "detailtekening":
-        return line.length > 25
+        return (line.stroke_width <= 1.5 and line.length >= 40) or line.is_dashed
+    
+    # DOORSNEDE: Dunne lijnen ≥40pt (alle richtingen)
     elif drawing_type == "doorsnede":
-        return (line.length > 30 and orientation == "vertical") or line.is_dashed
+        return (line.stroke_width <= 1.5 and line.length >= 40) or line.is_dashed
+    
+    # DETAILTEKENING: Zeer dunne lijnen ≥20pt (alle richtingen)
+    elif drawing_type == "detailtekening":
+        return (line.stroke_width <= 1.0 and line.length >= 20) or line.is_dashed
+    
+    # INSTALLATIETEKENING: Zeer dunne lijnen ≥30pt (alle richtingen)
+    elif drawing_type == "installatietekening":
+        return (line.stroke_width <= 1.0 and line.length >= 30) or line.is_dashed
+    
+    # BESTEKTEKENING: Afhankelijk van regio (alle richtingen)
     elif drawing_type == "bestektekening":
         label_lower = region_label.lower()
         if "grond" in label_lower or "verdieping" in label_lower:
-            return line.length > 50
+            return (line.stroke_width <= 1.5 and line.length >= 50) or line.is_dashed
         elif "gevel" in label_lower:
-            return line.length > 40
+            return (line.stroke_width <= 1.5 and line.length >= 40) or line.is_dashed
         elif "doorsnede" in label_lower:
-            return line.length > 30 and orientation == "vertical"
+            return (line.stroke_width <= 1.5 and line.length >= 40) or line.is_dashed
         else:
-            return line.length > 25
-    elif drawing_type == "installatietekening":
-        return line.stroke_width <= 1 or line.is_dashed
+            return (line.stroke_width <= 1.0 and line.length >= 20) or line.is_dashed
+    
+    # DEFAULT: Conservatief (alle richtingen)
     else:
-        return line.length > 10
+        return (line.stroke_width <= 1.5 and line.length >= 30) or line.is_dashed
 
 def should_include_text(text: VectorText, drawing_type: str, region_label: str) -> bool:
     """Determine if text should be included - prioritize valid dimensions with drawing-type specific rules"""
@@ -456,31 +467,18 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
         drawing_type = input_data.vision_output.drawing_type
         regions = input_data.vision_output.regions
         
-        logger.info(f"=== FILTERING START (Flexible Rules) ===")
+        logger.info(f"=== FILTERING START (Simplified Rules v6.0.0) ===")
         logger.info(f"Processing {drawing_type} with {len(regions)} regions")
         logger.info(f"Input: {len(vector_page.lines)} lines, {len(vector_page.texts)} texts")
         logger.info(f"Debug mode: {debug}")
+        logger.info(f"25pt buffer applied to all regions")
         
-        # Apply plattegrond-specific preprocessing
+        # Apply plattegrond-specific preprocessing (duplicate removal only)
         processed_lines = vector_page.lines
         if drawing_type == "plattegrond":
             logger.info(f"Applying plattegrond-specific preprocessing...")
-            
-            # Step 1: Filter by length first (≥100pt)
-            length_filtered_lines = [line for line in processed_lines if line.length >= 100]
-            logger.info(f"After length filter (≥100pt): {len(length_filtered_lines)} lines")
-            
-            # Step 2: Filter by orientation (only horizontal/vertical)
-            orientation_filtered_lines = []
-            for line in length_filtered_lines:
-                orientation = calculate_orientation(line.p1, line.p2, line.angle)
-                if orientation in ["horizontal", "vertical"]:
-                    orientation_filtered_lines.append(line)
-            logger.info(f"After orientation filter: {len(orientation_filtered_lines)} lines")
-            
-            # Step 3: Remove duplicate lines
-            processed_lines = remove_duplicate_lines(orientation_filtered_lines)
-            logger.info(f"After preprocessing: {len(processed_lines)} lines")
+            processed_lines = remove_duplicate_lines(vector_page.lines)
+            logger.info(f"After duplicate removal: {len(processed_lines)} lines")
         
         region_outputs = []
         total_lines_included = 0
@@ -503,21 +501,28 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
                             midpoint=calculate_midpoint(line.p1, line.p2)
                         )
                         region_lines.append(filtered_line)
+                        if debug:
+                            logger.debug(f"  ✅ Line included: {line.length:.1f}pt, stroke: {line.stroke_width}pt, orientation: {filtered_line.orientation}")
+                    elif debug:
+                        logger.debug(f"  ❌ Line excluded: {line.length:.1f}pt, stroke: {line.stroke_width}pt")
             
-            # Process texts for this region - FLEXIBLE OVERLAP DETECTION
+            # Process texts for this region - 25pt buffer overlap detection
             for text in vector_page.texts:
-                if text_overlaps_region(text, region.coordinate_block):  # ← UPDATED: text overlap instead of center
+                if text_overlaps_region(text, region.coordinate_block):
                     if should_include_text(text, drawing_type, region.label):
                         total_valid_dimension_texts += 1
                         
-                        # Create filtered text with midpoint (no orientation)
+                        # Create filtered text with midpoint
                         filtered_text = FilteredText(
                             text=text.text,
                             midpoint=calculate_text_midpoint(text.bounding_box)
-                            # Removed orientation field
                         )
                         
                         region_texts.append(filtered_text)
+                        if debug:
+                            logger.debug(f"  ✅ Text included: '{text.text}'")
+                    elif debug:
+                        logger.debug(f"  ❌ Text excluded: '{text.text}'")
             
             # Create region output
             region_data = RegionData(
@@ -582,46 +587,45 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "Filter API - Flexible Rules",
-        "version": "5.0.0-flexible"
+        "service": "Filter API - Simplified Rules",
+        "version": "6.0.0-simplified"
     }
 
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
-        "title": "Filter API - Flexible Rules",
-        "version": "5.0.0-flexible",
-        "description": "Optimized for Scale API with flexible region boundaries and text overlap detection",
-        "scale_api_features": [
-            "Text midpoints for precise line-text matching",
-            "Line orientations for directional matching",
-            "Clean production output (minimal JSON)",
-            "Valid dimension text filtering only",
-            "Debug mode for detailed output"
+        "title": "Filter API - Simplified Rules",
+        "version": "6.0.0-simplified",
+        "description": "Simplified filtering: all orientations, no max length, 25pt buffer",
+        "simplified_features": [
+            "✅ All orientations allowed (H/V/diagonal)",
+            "✅ No maximum length restrictions", 
+            "✅ 25pt buffer for both lines and text",
+            "✅ Only stroke width + min length filtering",
+            "✅ Dashed lines always included"
         ],
-        "flexible_features": [
-            "Region boundaries expanded by 20pt",
-            "Text overlap detection (not center-only)",
-            "Lowered threshold: 500mm for plattegrond (was 1000mm)",
-            "Removed text orientation (not used by Scale API)",
-            "Enhanced dimension filtering"
-        ],
-        "filtering_features": [
-            "Plattegrond-specific preprocessing (≥100pt, horizontal/vertical)",
-            "Enhanced dimension filtering (≥500mm for plattegrond)",
-            "Duplicate line removal",
-            "Pure dimension text validation (no letters/symbols)",
-            "Flexible regional boundary checking"
-        ],
+        "filtering_rules": {
+            "plattegrond": "stroke ≤1.5pt, length ≥50pt",
+            "gevelaanzicht": "stroke ≤1.5pt, length ≥40pt", 
+            "doorsnede": "stroke ≤1.5pt, length ≥40pt",
+            "detailtekening": "stroke ≤1.0pt, length ≥20pt",
+            "installatietekening": "stroke ≤1.0pt, length ≥30pt",
+            "bestektekening": "context-dependent rules",
+            "default": "stroke ≤1.5pt, length ≥30pt"
+        },
+        "text_filtering": {
+            "valid_patterns": ["3000", "3000mm", "3,5 m", "250 cm"],
+            "invalid_patterns": ["Keuken", "A-01", "Schaal 1:100", "Noord"],
+            "minimum_values": {
+                "plattegrond": "500mm",
+                "other": "100mm"
+            }
+        },
         "endpoints": {
             "/filter/": "Main filtering endpoint (add ?debug=true for detailed output)",
             "/filter-from-vector-api/": "Direct endpoint for Vector Drawing API output",
             "/health": "Health check"
-        },
-        "output_format": {
-            "production": "text, midpoint only (no orientation)",
-            "debug": "includes position and bounding_box fields"
         }
     }
 
