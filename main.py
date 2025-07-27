@@ -137,7 +137,7 @@ def calculate_text_orientation(bbox: List[float]) -> str:
     """Calculate text orientation based on bounding box dimensions"""
     width = abs(bbox[2] - bbox[0])
     height = abs(bbox[3] - bbox[1])
-    return "vertical" if width >= height else "horizontal"
+    return "horizontal" if width >= height else "vertical"
 
 def extract_dimension_value(text: str) -> Optional[float]:
     """
@@ -192,8 +192,8 @@ def is_valid_dimension(text: str, drawing_type: str = "general") -> bool:
     
     # Apply drawing-type specific minimum thresholds
     if drawing_type == "plattegrond":
-        # For plattegrond: minimum 1000mm to filter out noise like "3", "10", "12"
-        min_value = 1000
+        # For plattegrond: minimum 2000mm to filter out noise like "3", "10", "12"
+        min_value = 2000
         if extracted_value < min_value:
             logger.debug(f"Plattegrond filter: '{text_clean}' = {extracted_value}mm < {min_value}mm = excluded")
             return False
@@ -253,22 +253,22 @@ def should_include_line(line: VectorLine, drawing_type: str, region_label: str) 
     orientation = calculate_orientation(line.p1, line.p2, line.angle)
     
     if drawing_type == "plattegrond":
-        # Plattegrond rules: length ≥100pt and only horizontal/vertical
-        return line.length >= 100 and orientation in ["horizontal", "vertical"]
+        # Plattegrond rules: length ≥200pt and only horizontal/vertical
+        return line.length >= 200 and orientation in ["horizontal", "vertical"]
     elif drawing_type == "gevelaanzicht":
-        return line.length > 40
+        return line.length > 100
     elif drawing_type == "detailtekening":
-        return line.length > 25
+        return line.length > 50
     elif drawing_type == "doorsnede":
-        return (line.length > 30 and orientation == "vertical") or line.is_dashed
+        return (line.length > 50 and orientation == "vertical") or line.is_dashed
     elif drawing_type == "bestektekening":
         label_lower = region_label.lower()
         if "grond" in label_lower or "verdieping" in label_lower:
-            return line.length > 50
+            return line.length > 100
         elif "gevel" in label_lower:
-            return line.length > 40
+            return line.length > 50 and orientation == "vertical"
         elif "doorsnede" in label_lower:
-            return line.length > 30 and orientation == "vertical"
+            return line.length > 50 and orientation == "vertical"
         else:
             return line.length > 25
     elif drawing_type == "installatietekening":
@@ -464,9 +464,9 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
         if drawing_type == "plattegrond":
             logger.info(f"Applying plattegrond-specific preprocessing...")
             
-            # Step 1: Filter by length first (≥100pt)
-            length_filtered_lines = [line for line in processed_lines if line.length >= 100]
-            logger.info(f"After length filter (≥100pt): {len(length_filtered_lines)} lines")
+            # Step 1: Filter by length first (≥200pt)
+            length_filtered_lines = [line for line in processed_lines if line.length >= 200]
+            logger.info(f"After length filter (≥200pt): {len(length_filtered_lines)} lines")
             
             # Step 2: Filter by orientation (only horizontal/vertical)
             orientation_filtered_lines = []
