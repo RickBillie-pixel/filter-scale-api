@@ -16,8 +16,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Filter API - Scale API Compatible",
-    description="Optimized for Scale API with midpoints, orientations, and dimension filtering",
-    version="4.0.0-scale-compatible"
+    description="Optimized for Scale API with flexible region boundaries and text overlap detection",
+    version="5.0.0-flexible"
 )
 
 # CORS middleware
@@ -80,7 +80,7 @@ class FilteredLine(BaseModel):
 class FilteredText(BaseModel):
     text: str
     midpoint: Dict[str, float]
-    orientation: str
+    # Removed orientation - not used by Scale API
     
 class RegionData(BaseModel):
     label: str
@@ -133,12 +133,6 @@ def calculate_text_midpoint(bbox: List[float]) -> Dict[str, float]:
         "y": (bbox[1] + bbox[3]) / 2
     }
 
-def calculate_text_orientation(bbox: List[float]) -> str:
-    """Calculate text orientation based on bounding box dimensions"""
-    width = abs(bbox[2] - bbox[0])
-    height = abs(bbox[3] - bbox[1])
-    return "vertical" if width >= height else "horizontal"
-
 def extract_dimension_value(text: str) -> Optional[float]:
     """
     Extract numeric dimension value from text and convert to mm.
@@ -167,7 +161,7 @@ def is_valid_dimension(text: str, drawing_type: str = "general") -> bool:
     """
     Validate if text represents a pure dimension (numbers with optional units).
     Excludes texts with letters, symbols, or non-dimensional content.
-    For plattegrond: only values ≥1000 (mm) to avoid noise from small numbers.
+    Lowered thresholds for more flexibility.
     """
     if not text or not text.strip():
         return False
@@ -190,10 +184,10 @@ def is_valid_dimension(text: str, drawing_type: str = "general") -> bool:
         logger.debug(f"Could not extract numeric value from: '{text_clean}'")
         return False
     
-    # Apply drawing-type specific minimum thresholds
+    # Apply drawing-type specific minimum thresholds - LOWERED FOR FLEXIBILITY
     if drawing_type == "plattegrond":
-        # For plattegrond: minimum 1000mm to filter out noise like "3", "10", "12"
-        min_value = 1000
+        # For plattegrond: minimum 500mm (was 1000mm)
+        min_value = 500
         if extracted_value < min_value:
             logger.debug(f"Plattegrond filter: '{text_clean}' = {extracted_value}mm < {min_value}mm = excluded")
             return False
@@ -201,7 +195,7 @@ def is_valid_dimension(text: str, drawing_type: str = "general") -> bool:
             logger.debug(f"Valid plattegrond dimension: '{text_clean}' = {extracted_value}mm >= {min_value}mm")
             return True
     else:
-        # For other drawing types: minimum 100mm (existing behavior)
+        # For other drawing types: minimum 100mm (unchanged)
         min_value = 100
         if extracted_value < min_value:
             logger.debug(f"General filter: '{text_clean}' = {extracted_value}mm < {min_value}mm = excluded")
@@ -241,12 +235,20 @@ def line_intersects_region(line_p1: List[float], line_p2: List[float], region: L
         logger.warning(f"Shapely intersection failed: {e}")
         return False
 
-def text_in_region(text: VectorText, region: List[float]) -> bool:
-    """Check if text center is in region"""
-    center_x = (text.bounding_box[0] + text.bounding_box[2]) / 2
-    center_y = (text.bounding_box[1] + text.bounding_box[3]) / 2
+def text_overlaps_region(text: VectorText, region: List[float]) -> bool:
+    """Check if text bounding box overlaps with expanded region"""
+    # Expand region boundaries by 20pt in all directions
     x1, y1, x2, y2 = region
-    return x1 <= center_x <= x2 and y1 <= center_y <= y2
+    expanded_region = [x1 - 20, y1 - 20, x2 + 20, y2 + 20]
+    
+    # Text bounding box
+    text_x1, text_y1, text_x2, text_y2 = text.bounding_box
+    
+    # Check if bounding boxes overlap
+    return not (text_x2 < expanded_region[0] or  # text is left of region
+                text_x1 > expanded_region[2] or  # text is right of region
+                text_y2 < expanded_region[1] or  # text is below region
+                text_y1 > expanded_region[3])    # text is above region
 
 def should_include_line(line: VectorLine, drawing_type: str, region_label: str) -> bool:
     """Determine if line should be included based on drawing type and region"""
@@ -454,7 +456,7 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
         drawing_type = input_data.vision_output.drawing_type
         regions = input_data.vision_output.regions
         
-        logger.info(f"=== FILTERING START (Scale API Compatible) ===")
+        logger.info(f"=== FILTERING START (Flexible Rules) ===")
         logger.info(f"Processing {drawing_type} with {len(regions)} regions")
         logger.info(f"Input: {len(vector_page.lines)} lines, {len(vector_page.texts)} texts")
         logger.info(f"Debug mode: {debug}")
@@ -502,17 +504,17 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
                         )
                         region_lines.append(filtered_line)
             
-            # Process texts for this region - ONLY VALID DIMENSIONS
+            # Process texts for this region - FLEXIBLE OVERLAP DETECTION
             for text in vector_page.texts:
-                if text_in_region(text, region.coordinate_block):
+                if text_overlaps_region(text, region.coordinate_block):  # ← UPDATED: text overlap instead of center
                     if should_include_text(text, drawing_type, region.label):
                         total_valid_dimension_texts += 1
                         
-                        # Create filtered text with midpoint and orientation
+                        # Create filtered text with midpoint (no orientation)
                         filtered_text = FilteredText(
                             text=text.text,
-                            midpoint=calculate_text_midpoint(text.bounding_box),
-                            orientation=calculate_text_orientation(text.bounding_box)
+                            midpoint=calculate_text_midpoint(text.bounding_box)
+                            # Removed orientation field
                         )
                         
                         region_texts.append(filtered_text)
@@ -580,30 +582,37 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "Filter API - Scale Compatible",
-        "version": "4.0.0-scale-compatible"
+        "service": "Filter API - Flexible Rules",
+        "version": "5.0.0-flexible"
     }
 
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
-        "title": "Filter API - Scale API Compatible",
-        "version": "4.0.0-scale-compatible",
-        "description": "Optimized for Scale API with midpoints, orientations, and dimension filtering",
+        "title": "Filter API - Flexible Rules",
+        "version": "5.0.0-flexible",
+        "description": "Optimized for Scale API with flexible region boundaries and text overlap detection",
         "scale_api_features": [
             "Text midpoints for precise line-text matching",
-            "Text and line orientations for directional matching",
+            "Line orientations for directional matching",
             "Clean production output (minimal JSON)",
             "Valid dimension text filtering only",
             "Debug mode for detailed output"
         ],
+        "flexible_features": [
+            "Region boundaries expanded by 20pt",
+            "Text overlap detection (not center-only)",
+            "Lowered threshold: 500mm for plattegrond (was 1000mm)",
+            "Removed text orientation (not used by Scale API)",
+            "Enhanced dimension filtering"
+        ],
         "filtering_features": [
             "Plattegrond-specific preprocessing (≥100pt, horizontal/vertical)",
-            "Enhanced dimension filtering (≥1000mm for plattegrond)",
+            "Enhanced dimension filtering (≥500mm for plattegrond)",
             "Duplicate line removal",
             "Pure dimension text validation (no letters/symbols)",
-            "Regional boundary checking"
+            "Flexible regional boundary checking"
         ],
         "endpoints": {
             "/filter/": "Main filtering endpoint (add ?debug=true for detailed output)",
@@ -611,7 +620,7 @@ async def root():
             "/health": "Health check"
         },
         "output_format": {
-            "production": "text, midpoint, orientation only",
+            "production": "text, midpoint only (no orientation)",
             "debug": "includes position and bounding_box fields"
         }
     }
