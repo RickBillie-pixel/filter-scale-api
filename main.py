@@ -537,7 +537,7 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
         drawing_type = input_data.vision_output.drawing_type
         regions = input_data.vision_output.regions
         
-        logger.info(f"=== FILTERING START (v7.0.0 - Vision Compatible) ===")
+        logger.info(f"=== FILTERING START (v7.0.0 - Optimized) ===")
         logger.info(f"Processing {drawing_type} with {len(regions)} regions")
         logger.info(f"Input: {len(vector_page.lines)} lines, {len(vector_page.texts)} texts")
         logger.info(f"Debug mode: {debug}")
@@ -548,12 +548,35 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
             logger.info("Skipping installatietekening - no processing")
             return CleanOutput(drawing_type=drawing_type, regions=[])
         
-        # Apply plattegrond-specific preprocessing (duplicate removal only)
+        # OPTIMIZED: Apply filtering FIRST, then duplicate removal for plattegrond
         processed_lines = vector_page.lines
         if drawing_type == "plattegrond":
             logger.info(f"Applying plattegrond-specific preprocessing...")
-            processed_lines = remove_duplicate_lines(vector_page.lines)
-            logger.info(f"After duplicate removal: {len(processed_lines)} lines")
+            
+            # STEP 1: Pre-filter lines based on plattegrond rules (MUCH faster)
+            pre_filtered_lines = []
+            plattegrond_rule_applied = 0
+            
+            for line in vector_page.lines:
+                # Apply plattegrond line rules first
+                if (line.stroke_width <= 1.5 and line.length >= 50) or line.is_dashed:
+                    pre_filtered_lines.append(line)
+                    plattegrond_rule_applied += 1
+            
+            logger.info(f"After plattegrond rules filter: {len(pre_filtered_lines)} lines (was {len(vector_page.lines)})")
+            logger.info(f"Filtered out {len(vector_page.lines) - len(pre_filtered_lines)} lines that didn't meet criteria")
+            
+            # STEP 2: Remove duplicates from the much smaller filtered set
+            if len(pre_filtered_lines) > 0:
+                processed_lines = remove_duplicate_lines(pre_filtered_lines)
+                logger.info(f"After duplicate removal: {len(processed_lines)} lines")
+            else:
+                processed_lines = pre_filtered_lines
+                logger.info("No lines left after filtering - skipping duplicate removal")
+        else:
+            # For other drawing types: no preprocessing needed
+            logger.info(f"No preprocessing needed for {drawing_type}")
+            processed_lines = vector_page.lines
         
         region_outputs = []
         total_lines_included = 0
@@ -565,17 +588,25 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
             
             logger.info(f"\nProcessing region: {region.label}")
             
-            # NEW v7.0.0: Parse drawing type for bestektekening regions
+            # Parse drawing type for bestektekening regions
             parsed_drawing_type = None
             if drawing_type == "bestektekening":
                 parsed_drawing_type = parse_bestektekening_region_type(region.label)
                 logger.info(f"  Parsed drawing type: {parsed_drawing_type}")
             
             # Process lines for this region
+            lines_in_region = 0
+            lines_passed_filter = 0
+            
             for line in processed_lines:
                 if line_intersects_region(line.p1, line.p2, region.coordinate_block):
-                    if should_include_line(line, drawing_type, region.label):
+                    lines_in_region += 1
+                    
+                    # For plattegrond, lines are already pre-filtered, so just check region intersection
+                    if drawing_type == "plattegrond":
+                        # Lines are already filtered by plattegrond rules, just add them
                         total_lines_included += 1
+                        lines_passed_filter += 1
                         filtered_line = FilteredLine(
                             length=line.length,
                             orientation=calculate_orientation(line.p1, line.p2, line.angle),
@@ -584,14 +615,35 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
                         region_lines.append(filtered_line)
                         if debug:
                             logger.debug(f"  ✅ Line included: {line.length:.1f}pt, stroke: {line.stroke_width}pt, orientation: {filtered_line.orientation}")
-                    elif debug:
-                        logger.debug(f"  ❌ Line excluded: {line.length:.1f}pt, stroke: {line.stroke_width}pt")
+                    else:
+                        # For other drawing types, apply filtering rules
+                        if should_include_line(line, drawing_type, region.label):
+                            total_lines_included += 1
+                            lines_passed_filter += 1
+                            filtered_line = FilteredLine(
+                                length=line.length,
+                                orientation=calculate_orientation(line.p1, line.p2, line.angle),
+                                midpoint=calculate_midpoint(line.p1, line.p2)
+                            )
+                            region_lines.append(filtered_line)
+                            if debug:
+                                logger.debug(f"  ✅ Line included: {line.length:.1f}pt, stroke: {line.stroke_width}pt, orientation: {filtered_line.orientation}")
+                        elif debug:
+                            logger.debug(f"  ❌ Line excluded: {line.length:.1f}pt, stroke: {line.stroke_width}pt")
+            
+            logger.info(f"  Lines in region: {lines_in_region}, passed filter: {lines_passed_filter}")
             
             # Process texts for this region - 25pt buffer overlap detection
+            texts_in_region = 0
+            texts_passed_filter = 0
+            
             for text in vector_page.texts:
                 if text_overlaps_region(text, region.coordinate_block):
+                    texts_in_region += 1
+                    
                     if should_include_text(text, drawing_type, region.label):
                         total_valid_dimension_texts += 1
+                        texts_passed_filter += 1
                         
                         # Create filtered text with midpoint
                         filtered_text = FilteredText(
@@ -605,16 +657,18 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
                     elif debug:
                         logger.debug(f"  ❌ Text excluded: '{text.text}'")
             
+            logger.info(f"  Texts in region: {texts_in_region}, passed filter: {texts_passed_filter}")
+            
             # Create region output with parsed drawing type
             region_data = RegionData(
                 label=region.label,
                 lines=region_lines,
                 texts=region_texts,
-                parsed_drawing_type=parsed_drawing_type  # NEW: For Scale API compatibility
+                parsed_drawing_type=parsed_drawing_type
             )
             region_outputs.append(region_data)
             
-            logger.info(f"  {region.label} results:")
+            logger.info(f"  {region.label} final results:")
             logger.info(f"    Lines included: {len(region_lines)}")
             logger.info(f"    Valid dimension texts: {len(region_texts)}")
             if parsed_drawing_type:
@@ -627,8 +681,10 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
         )
         
         logger.info(f"\n=== FILTERING COMPLETE ===")
+        logger.info(f"Total lines processed: {len(processed_lines)}")
         logger.info(f"Total lines included: {total_lines_included}")
         logger.info(f"Total valid dimension texts: {total_valid_dimension_texts}")
+        logger.info(f"Regions processed: {len(region_outputs)}")
         
         return output
     
