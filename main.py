@@ -537,7 +537,7 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
         drawing_type = input_data.vision_output.drawing_type
         regions = input_data.vision_output.regions
         
-        logger.info(f"=== FILTERING START (v7.0.0 - Optimized) ===")
+        logger.info(f"=== FILTERING START (v7.0.0 - FIXED) ===")
         logger.info(f"Processing {drawing_type} with {len(regions)} regions")
         logger.info(f"Input: {len(vector_page.lines)} lines, {len(vector_page.texts)} texts")
         logger.info(f"Debug mode: {debug}")
@@ -548,35 +548,37 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
             logger.info("Skipping installatietekening - no processing")
             return CleanOutput(drawing_type=drawing_type, regions=[])
         
-        # OPTIMIZED: Apply filtering FIRST, then duplicate removal for plattegrond
-        processed_lines = vector_page.lines
-        if drawing_type == "plattegrond":
-            logger.info(f"Applying plattegrond-specific preprocessing...")
-            
-            # STEP 1: Pre-filter lines based on plattegrond rules (MUCH faster)
-            pre_filtered_lines = []
-            plattegrond_rule_applied = 0
-            
+        # STEP 1: FIRST filter ALL lines based on drawing type rules
+        logger.info(f"STEP 1: Filtering all lines based on {drawing_type} rules...")
+        
+        if drawing_type == "bestektekening":
+            # For bestektekening, we need to apply the most permissive rules first
+            # since different regions may have different requirements
+            filtered_lines = []
             for line in vector_page.lines:
-                # Apply plattegrond line rules first
-                if (line.stroke_width <= 1.5 and line.length >= 50) or line.is_dashed:
-                    pre_filtered_lines.append(line)
-                    plattegrond_rule_applied += 1
-            
-            logger.info(f"After plattegrond rules filter: {len(pre_filtered_lines)} lines (was {len(vector_page.lines)})")
-            logger.info(f"Filtered out {len(vector_page.lines) - len(pre_filtered_lines)} lines that didn't meet criteria")
-            
-            # STEP 2: Remove duplicates from the much smaller filtered set
-            if len(pre_filtered_lines) > 0:
-                processed_lines = remove_duplicate_lines(pre_filtered_lines)
-                logger.info(f"After duplicate removal: {len(processed_lines)} lines")
-            else:
-                processed_lines = pre_filtered_lines
-                logger.info("No lines left after filtering - skipping duplicate removal")
+                # Use most permissive rules that could apply to any bestektekening region
+                if (line.stroke_width <= 1.5 and line.length >= 20) or line.is_dashed:
+                    filtered_lines.append(line)
         else:
-            # For other drawing types: no preprocessing needed
-            logger.info(f"No preprocessing needed for {drawing_type}")
-            processed_lines = vector_page.lines
+            # For other drawing types, apply standard rules
+            filtered_lines = []
+            for line in vector_page.lines:
+                if should_include_line(line, drawing_type, ""):  # Empty region label for global filtering
+                    filtered_lines.append(line)
+        
+        logger.info(f"After drawing type filtering: {len(filtered_lines)} lines (was {len(vector_page.lines)})")
+        logger.info(f"Filtered out {len(vector_page.lines) - len(filtered_lines)} lines that didn't meet {drawing_type} criteria")
+        
+        # STEP 2: Remove duplicates from filtered lines  
+        logger.info(f"STEP 2: Removing duplicates from filtered lines...")
+        if len(filtered_lines) > 0:
+            unique_filtered_lines = remove_duplicate_lines(filtered_lines)
+        else:
+            unique_filtered_lines = filtered_lines
+            logger.info("No lines to deduplicate")
+        
+        # STEP 3: Process regions and check which filtered lines fall in each region
+        logger.info(f"STEP 3: Processing regions with {len(unique_filtered_lines)} filtered lines...")
         
         region_outputs = []
         total_lines_included = 0
@@ -590,33 +592,22 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
             
             # Parse drawing type for bestektekening regions
             parsed_drawing_type = None
+            effective_drawing_type = drawing_type
             if drawing_type == "bestektekening":
                 parsed_drawing_type = parse_bestektekening_region_type(region.label)
+                effective_drawing_type = parsed_drawing_type
                 logger.info(f"  Parsed drawing type: {parsed_drawing_type}")
             
             # Process lines for this region
             lines_in_region = 0
             lines_passed_filter = 0
             
-            for line in processed_lines:
+            for line in unique_filtered_lines:
                 if line_intersects_region(line.p1, line.p2, region.coordinate_block):
                     lines_in_region += 1
                     
-                    # For plattegrond, lines are already pre-filtered, so just check region intersection
-                    if drawing_type == "plattegrond":
-                        # Lines are already filtered by plattegrond rules, just add them
-                        total_lines_included += 1
-                        lines_passed_filter += 1
-                        filtered_line = FilteredLine(
-                            length=line.length,
-                            orientation=calculate_orientation(line.p1, line.p2, line.angle),
-                            midpoint=calculate_midpoint(line.p1, line.p2)
-                        )
-                        region_lines.append(filtered_line)
-                        if debug:
-                            logger.debug(f"  ✅ Line included: {line.length:.1f}pt, stroke: {line.stroke_width}pt, orientation: {filtered_line.orientation}")
-                    else:
-                        # For other drawing types, apply filtering rules
+                    # For bestektekening, apply additional region-specific filtering
+                    if drawing_type == "bestektekening":
                         if should_include_line(line, drawing_type, region.label):
                             total_lines_included += 1
                             lines_passed_filter += 1
@@ -629,7 +620,19 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
                             if debug:
                                 logger.debug(f"  ✅ Line included: {line.length:.1f}pt, stroke: {line.stroke_width}pt, orientation: {filtered_line.orientation}")
                         elif debug:
-                            logger.debug(f"  ❌ Line excluded: {line.length:.1f}pt, stroke: {line.stroke_width}pt")
+                            logger.debug(f"  ❌ Line excluded by region rules: {line.length:.1f}pt, stroke: {line.stroke_width}pt")
+                    else:
+                        # For other drawing types, lines are already filtered, just add them
+                        total_lines_included += 1
+                        lines_passed_filter += 1
+                        filtered_line = FilteredLine(
+                            length=line.length,
+                            orientation=calculate_orientation(line.p1, line.p2, line.angle),
+                            midpoint=calculate_midpoint(line.p1, line.p2)
+                        )
+                        region_lines.append(filtered_line)
+                        if debug:
+                            logger.debug(f"  ✅ Line included: {line.length:.1f}pt, stroke: {line.stroke_width}pt, orientation: {filtered_line.orientation}")
             
             logger.info(f"  Lines in region: {lines_in_region}, passed filter: {lines_passed_filter}")
             
@@ -681,7 +684,7 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
         )
         
         logger.info(f"\n=== FILTERING COMPLETE ===")
-        logger.info(f"Total lines processed: {len(processed_lines)}")
+        logger.info(f"Total lines processed: {len(unique_filtered_lines)}")
         logger.info(f"Total lines included: {total_lines_included}")
         logger.info(f"Total valid dimension texts: {total_valid_dimension_texts}")
         logger.info(f"Regions processed: {len(region_outputs)}")
@@ -727,8 +730,8 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "Filter API v7.0.0 - Vision Compatible",
-        "version": "7.0.0",
+        "service": "Filter API v7.0.0 - FIXED",
+        "version": "7.0.0-fixed",
         "timestamp": datetime.now().isoformat()
     }
 
@@ -736,42 +739,19 @@ async def health_check():
 async def root():
     """Root endpoint with API information"""
     return {
-        "title": "Filter API v7.0.0 - Vision Compatible Bestektekening",
-        "version": "7.0.0",
-        "description": "Updated for Vision's new bestektekening region format with drawing type classification",
-        "new_features_v7": [
-            "✅ Parses drawing types from Vision region labels",
-            "✅ Handles new bestektekening format: 'Begane grond (plattegrond)'",
-            "✅ Fallback to keyword matching for legacy compatibility",
-            "✅ Adds parsed_drawing_type field to RegionData for Scale API",
-            "✅ Enhanced logging for bestektekening region processing",
-            "✅ Installatietekening completely skipped"
+        "title": "Filter API v7.0.0 - FIXED Filtering Logic",
+        "version": "7.0.0-fixed",
+        "description": "FIXED: Correct filtering order - filter first, then check regions, then remove duplicates",
+        "bug_fix": "Corrected filtering logic to apply rules BEFORE region checking",
+        "correct_workflow": [
+            "1. Filter ALL lines based on drawing type rules (stroke width + length)",
+            "2. Remove duplicates from filtered lines",
+            "3. Check which filtered lines fall in each region (25pt buffer)",
+            "4. For bestektekening: apply additional region-specific filtering",
+            "5. Filter texts for valid dimensions with drawing type thresholds"
         ],
-        "parsing_examples": {
-            "new_format": {
-                "input": "Begane grond (plattegrond)",
-                "extracted": "plattegrond",
-                "rules_applied": "plattegrond filtering rules"
-            },
-            "legacy_format": {
-                "input": "Eerste verdieping",
-                "fallback": "plattegrond (keyword: verdieping)",
-                "rules_applied": "plattegrond filtering rules"
-            },
-            "unknown_format": {
-                "input": "Onbekende regio",
-                "fallback": "unknown",
-                "rules_applied": "default conservative rules"
-            }
-        },
-        "bestektekening_region_rules": {
-            "plattegrond": "stroke ≤1.5pt, length ≥50pt",
-            "gevelaanzicht": "stroke ≤1.5pt, length ≥40pt",
-            "doorsnede": "stroke ≤1.5pt, length ≥40pt", 
-            "detailtekening_kozijn": "stroke ≤1.0pt, length ≥20pt",
-            "detailtekening_plattegrond": "stroke ≤1.0pt, length ≥20pt",
-            "unknown": "stroke ≤1.5pt, length ≥30pt (conservative)"
-        },
+        "old_bug": "Was checking regions first, then applying filters - incorrect order",
+        "new_fix": "Now filters globally first, then checks region intersection",
         "filtering_rules": {
             "plattegrond": "stroke ≤1.5pt, length ≥50pt",
             "gevelaanzicht": "stroke ≤1.5pt, length ≥40pt", 
@@ -779,9 +759,15 @@ async def root():
             "detailtekening": "stroke ≤1.0pt, length ≥20pt",
             "detailtekening_kozijn": "stroke ≤1.0pt, length ≥20pt",
             "detailtekening_plattegrond": "stroke ≤1.0pt, length ≥20pt",
-            "bestektekening": "per_region_rules based on parsed drawing type",
+            "bestektekening": "permissive global filter (≤1.5pt, ≥20pt), then region-specific",
             "installatietekening": "SKIPPED - no processing",
             "default": "stroke ≤1.5pt, length ≥30pt"
+        },
+        "bestektekening_handling": {
+            "step1": "Apply permissive global filter (stroke ≤1.5pt, length ≥20pt)",
+            "step2": "Remove duplicates",
+            "step3": "Check region intersection",
+            "step4": "Apply region-specific rules based on parsed drawing type"
         },
         "text_filtering": {
             "valid_patterns": ["3000", "3000mm", "3,5 m", "250 cm"],
@@ -789,51 +775,25 @@ async def root():
             "minimum_values": {
                 "plattegrond": "500mm",
                 "other": "100mm"
-            },
-            "bestektekening": "Uses parsed region drawing type for validation"
+            }
         },
-        "output_enhancements": {
-            "parsed_drawing_type": "Added to RegionData for bestektekening regions",
-            "scale_api_compatibility": "Ready for Scale API v7.0.0",
-            "debug_logging": "Enhanced region processing visibility"
+        "technical_improvements": {
+            "performance": "Much faster - filters before region checking",
+            "accuracy": "Correct filtering logic implementation", 
+            "logging": "Clear 3-step process logging",
+            "buffer": "25pt buffer for both lines and texts",
+            "deduplication": "1pt tolerance for coordinate matching"
         },
-        "compatibility": {
-            "filter_api_v6": "Backward compatible with existing API calls",
-            "scale_api_v7": "Forward compatible with new parsed_drawing_type field",
-            "master_api": "Works with existing Master API v4.1.0"
-        },
-        "technical_specifications": {
-            "buffer_size": "25pt for both lines and texts",
-            "orientation_detection": "Horizontal, vertical, diagonal",
-            "duplicate_removal": "For plattegrond only (1pt tolerance)",
-            "region_intersection": "Shapely-based geometric intersection",
-            "coordinate_formats": "Supports both dict and list formats"
-        },
-        "api_workflow": [
-            "1. Receive Vector data (lines/texts) and Vision output (regions)",
-            "2. Parse bestektekening region labels to extract drawing types",
-            "3. Apply 25pt buffer expansion to all regions",
-            "4. Filter lines based on stroke width and length per drawing type",
-            "5. Filter texts to only include valid dimensions with units",
-            "6. Calculate orientations and midpoints for all filtered elements",
-            "7. Return clean output with parsed_drawing_type for Scale API"
-        ],
         "endpoints": {
             "/filter/": "Main filtering endpoint (add ?debug=true for detailed output)",
             "/filter-from-vector-api/": "Direct endpoint for Vector Drawing API output",
             "/health": "Health check with timestamp",
             "/": "This documentation endpoint"
-        },
-        "logging_levels": {
-            "INFO": "High-level processing steps and results",
-            "DEBUG": "Detailed line/text inclusion/exclusion decisions",
-            "WARNING": "Parsing failures and fallback usage",
-            "ERROR": "Processing errors and exceptions"
         }
     }
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
-    logger.info(f"Starting Filter API v7.0.0 on port {port}")
+    logger.info(f"Starting Filter API v7.0.0-FIXED on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
