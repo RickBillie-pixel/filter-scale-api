@@ -15,9 +15,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Filter API v7.0.1 - Pydantic v2 Compatible",
-    description="Fixed Pydantic compatibility for Scale API integration",
-    version="7.0.1"
+    title="Filter API v7.0.2 - Fixed Dimension Filtering",
+    description="FIXED: Enhanced dimension filtering for gevel/doorsnede with P, V, + symbols",
+    version="7.0.2"
 )
 
 # CORS middleware
@@ -174,50 +174,90 @@ def calculate_text_midpoint(bbox: List[float]) -> Dict[str, float]:
     }
 
 def extract_dimension_value(text: str) -> Optional[float]:
-    """Extract numeric dimension value from text and convert to mm"""
+    """FIXED: Extract numeric dimension value from text with enhanced patterns"""
     text_clean = text.strip()
     
-    match = re.match(r'^(\d+(?:[,.]\d+)?)\s*(mm|cm|m)?$', text_clean)
-    if match:
-        value_str, unit = match.groups()
-        value_str = value_str.replace(',', '.')
-        value = float(value_str)
+    # ENHANCED: Handle various dimension formats including P, V, + symbols
+    patterns = [
+        # Standard format: 2400mm, 3.5m, 250cm
+        r'^(\d+(?:[,.]\d+)?)\s*(mm|cm|m)?$',
         
-        if unit == 'cm':
-            return value * 10
-        elif unit == 'm':
-            return value * 1000
-        else:
-            return value
+        # With + prefix: +7555, +3000, +6410
+        r'^\+(\d+(?:[,.]\d+)?)\s*(mm|cm|m|p|v)?$',
+        
+        # With P suffix: 7555P, 3000P, 6410P  
+        r'^(\d+(?:[,.]\d+)?)\s*[pP]\s*(mm|cm|m)?$',
+        
+        # With V suffix: 7555V, 3000V
+        r'^(\d+(?:[,.]\d+)?)\s*[vV]\s*(mm|cm|m)?$',
+        
+        # Combined formats: +7555P, +3000P, +6410P, +7075P
+        r'^\+(\d+(?:[,.]\d+)?)\s*[pPvV]\s*(mm|cm|m)?$',
+        
+        # With + suffix: 6032+p, 3749+p (space variations)
+        r'^(\d+(?:[,.]\d+)?)\s*\+\s*[pPvV]\s*(mm|cm|m)?$',
+        
+        # Additional space variations: 6032 +p, 3749 + p
+        r'^(\d+(?:[,.]\d+)?)\s+\+\s*[pPvV]\s*(mm|cm|m)?$'
+    ]
+    
+    for pattern in patterns:
+        match = re.match(pattern, text_clean, re.IGNORECASE)
+        if match:
+            value_str = match.group(1).replace(',', '.')
+            value = float(value_str)
+            
+            # Get unit (if specified in match group 2)
+            unit = match.group(2) if len(match.groups()) > 1 and match.group(2) else None
+            
+            # Convert to mm based on unit (ignore p/v/P/V - they're not units)
+            if unit and unit.lower() in ['mm', 'cm', 'm']:
+                if unit.lower() == 'cm':
+                    return value * 10
+                elif unit.lower() == 'm':
+                    return value * 1000
+                else:  # mm
+                    return value
+            else:
+                # No unit specified or P/V suffix - assume mm
+                return value
     
     return None
 
 def is_valid_dimension(text: str, drawing_type: str = "general") -> bool:
-    """Validate if text represents a pure dimension"""
+    """FIXED: Enhanced validation for dimension text with drawing type specific rules"""
     if not text or not text.strip():
         return False
     
     text_clean = text.strip()
-    pattern = r'^\d+([,.]\d+)?\s*(mm|cm|m)?$'
     
-    is_valid = bool(re.match(pattern, text_clean))
+    # For specific drawing types that need enhanced dimension support
+    enhanced_types = ["doorsnede", "gevelaanzicht", "bestektekening", "detailtekening_kozijn"]
     
-    if not is_valid:
-        return False
-    
+    # Try to extract dimension value using enhanced patterns
     extracted_value = extract_dimension_value(text_clean)
     if extracted_value is None:
         return False
     
+    # Drawing type specific validation
     if drawing_type == "plattegrond":
-        min_value = 500
+        min_value = 500  # Plattegrond dimensions usually larger
         if extracted_value < min_value:
+            logger.debug(f"Dimension '{text_clean}' too small for plattegrond: {extracted_value}mm < {min_value}mm")
             return False
     else:
-        min_value = 100
+        min_value = 100  # Other types allow smaller dimensions
         if extracted_value < min_value:
+            logger.debug(f"Dimension '{text_clean}' too small: {extracted_value}mm < {min_value}mm")
             return False
     
+    # Maximum reasonable value check (100 meters)
+    max_value = 100000
+    if extracted_value > max_value:
+        logger.debug(f"Dimension '{text_clean}' too large: {extracted_value}mm > {max_value}mm")
+        return False
+    
+    logger.debug(f"Valid dimension found: '{text_clean}' = {extracted_value}mm for {drawing_type}")
     return True
 
 def line_intersects_region(line_p1: List[float], line_p2: List[float], region: List[float]) -> bool:
@@ -294,7 +334,7 @@ def should_include_line(line: VectorLine, drawing_type: str, region_label: str) 
         return (line.stroke_width <= 1.5 and line.length >= 30) or line.is_dashed
 
 def should_include_text(text: VectorText, drawing_type: str, region_label: str) -> bool:
-    """Enhanced text filtering with bestektekening region parsing"""
+    """FIXED: Enhanced text filtering with bestektekening region parsing and enhanced dimension support"""
     
     if drawing_type == "bestektekening":
         region_drawing_type = parse_bestektekening_region_type(region_label)
@@ -305,7 +345,15 @@ def should_include_text(text: VectorText, drawing_type: str, region_label: str) 
     if effective_drawing_type == "installatietekening":
         return False
     
-    return is_valid_dimension(text.text, effective_drawing_type)
+    # FIXED: Use enhanced dimension validation
+    is_valid = is_valid_dimension(text.text, effective_drawing_type)
+    
+    if is_valid:
+        logger.debug(f"Including dimension text: '{text.text}' for {effective_drawing_type}")
+    else:
+        logger.debug(f"Excluding text: '{text.text}' for {effective_drawing_type}")
+    
+    return is_valid
 
 def remove_duplicate_lines(lines: List[VectorLine]) -> List[VectorLine]:
     """Remove duplicate lines based on coordinates with tolerance"""
@@ -469,11 +517,11 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
         drawing_type = input_data.vision_output.drawing_type
         regions = input_data.vision_output.regions
         
-        logger.info(f"=== FILTERING START (v7.0.1 - FIXED) ===")
+        logger.info(f"=== FILTERING START (v7.0.2 - FIXED DIMENSIONS) ===")
         logger.info(f"Processing {drawing_type} with {len(regions)} regions")
         logger.info(f"Input: {len(vector_page.lines)} lines, {len(vector_page.texts)} texts")
         logger.info(f"Debug mode: {debug}")
-        logger.info(f"25pt buffer applied to all regions")
+        logger.info(f"Enhanced dimension support: +7555P, 6032+p, etc.")
         
         # Skip installatietekening entirely
         if drawing_type == "installatietekening":
@@ -559,6 +607,7 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
             # Process texts for this region
             texts_in_region = 0
             texts_passed_filter = 0
+            dimension_examples = []
             
             for text in vector_page.texts:
                 if text_overlaps_region(text, region.coordinate_block):
@@ -567,6 +616,7 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
                     if should_include_text(text, drawing_type, region.label):
                         total_valid_dimension_texts += 1
                         texts_passed_filter += 1
+                        dimension_examples.append(text.text)
                         
                         filtered_text = FilteredText(
                             text=text.text,
@@ -575,6 +625,8 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
                         region_texts.append(filtered_text)
             
             logger.info(f"  Texts in region: {texts_in_region}, passed filter: {texts_passed_filter}")
+            if dimension_examples:
+                logger.info(f"  Example dimensions: {dimension_examples[:5]}")
             
             # Create region output with parsed drawing type
             region_data = RegionData(
@@ -642,51 +694,85 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "Filter API v7.0.1 - Pydantic Compatible",
-        "version": "7.0.1",
+        "service": "Filter API v7.0.2 - Enhanced Dimension Filtering",
+        "version": "7.0.2",
         "timestamp": datetime.now().isoformat(),
         "pydantic_version": "1.10.18",
-        "compatibility": "Scale API v7.0.0"
+        "compatibility": "Scale API v7.1.0",
+        "dimension_support": {
+            "enhanced_patterns": [
+                "+7555P", "+3000P", "+6410P", "+7075P",
+                "6032+p", "3749+p", "7555P", "3000V",
+                "2400mm", "3.5m", "250cm"
+            ],
+            "supported_suffixes": ["P", "V", "p", "v"],
+            "supported_prefixes": ["+"],
+            "supported_units": ["mm", "cm", "m"]
+        }
     }
 
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
-        "title": "Filter API v7.0.1 - Pydantic Compatible",
-        "version": "7.0.1",
-        "description": "FIXED: Pydantic compatibility issue with Scale API",
-        "bug_fix": "Resolved Pydantic version conflict between Filter API and Scale API",
+        "title": "Filter API v7.0.2 - Enhanced Dimension Filtering",
+        "version": "7.0.2",
+        "description": "FIXED: Enhanced dimension filtering for gevel/doorsnede with P, V, + symbols",
+        "bug_fix": {
+            "issue": "Dimension filtering too strict - excluded P, V, + symbols used in gevel/doorsnede",
+            "examples_now_supported": [
+                "+7555P", "+3000P", "+6410P", "+7075P",
+                "6032+p", "3749+p", "7555P", "3000V",
+                "2400", "3.5m", "250cm"
+            ],
+            "regex_patterns": "7 enhanced patterns for various dimension formats"
+        },
+        "enhanced_dimension_patterns": {
+            "standard": "2400mm, 3.5m, 250cm",
+            "with_plus_prefix": "+7555, +3000, +6410", 
+            "with_p_suffix": "7555P, 3000P, 6410P",
+            "with_v_suffix": "7555V, 3000V",
+            "combined_formats": "+7555P, +3000P, +6410P, +7075P",
+            "plus_suffix": "6032+p, 3749+p",
+            "space_variations": "6032 +p, 3749 + p"
+        },
+        "drawing_type_specific": {
+            "plattegrond": "Min 500mm (larger dimensions)",
+            "doorsnede": "Min 100mm + enhanced P/V/+ support",
+            "gevelaanzicht": "Min 100mm + enhanced P/V/+ support", 
+            "detailtekening_kozijn": "Min 100mm + enhanced P/V/+ support",
+            "bestektekening": "Region-specific rules with enhanced support"
+        },
         "correct_workflow": [
             "1. Filter ALL lines based on drawing type rules (stroke width + length)",
             "2. Remove duplicates from filtered lines", 
             "3. Check which filtered lines fall in each region (25pt buffer)",
             "4. For bestektekening: apply additional region-specific filtering",
-            "5. Filter texts for valid dimensions with drawing type thresholds"
+            "5. Filter texts for valid dimensions with ENHANCED pattern matching"
         ],
-        "pydantic_compatibility": {
+        "compatibility": {
             "filter_api": "Pydantic v1.10.18",
-            "scale_api": "Pydantic v2.6.4",
-            "fix": "Ensured compatible data structures"
+            "scale_api": "Pydantic v2.6.4 + v7.1.0 distance rules",
+            "dimension_extraction": "Enhanced for gevel/doorsnede requirements"
         },
         "filtering_rules": {
-            "plattegrond": "stroke ≤1.5pt, length ≥50pt",
-            "gevelaanzicht": "stroke ≤1.5pt, length ≥40pt", 
-            "doorsnede": "stroke ≤1.5pt, length ≥40pt",
-            "detailtekening": "stroke ≤1.0pt, length ≥20pt",
-            "bestektekening": "permissive global filter (≤1.5pt, ≥20pt), then region-specific",
+            "plattegrond": "stroke ≤1.5pt, length ≥50pt, dimensions ≥500mm",
+            "gevelaanzicht": "stroke ≤1.5pt, length ≥40pt, dimensions ≥100mm + P/V/+", 
+            "doorsnede": "stroke ≤1.5pt, length ≥40pt, dimensions ≥100mm + P/V/+",
+            "detailtekening_kozijn": "stroke ≤1.0pt, length ≥20pt, dimensions ≥100mm + P/V/+",
+            "bestektekening": "permissive global filter, then region-specific + enhanced dimensions",
             "installatietekening": "SKIPPED - no processing"
         },
         "endpoints": {
             "/filter/": "Main filtering endpoint (add ?debug=true for detailed output)",
             "/filter-from-vector-api/": "Direct endpoint for Vector Drawing API output",
-            "/health": "Health check with timestamp",
-            "/": "This documentation endpoint"
+            "/health": "Health check with enhanced dimension support info",
+            "/": "This comprehensive documentation endpoint"
         }
     }
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
-    logger.info(f"Starting Filter API v7.0.1-FIXED on port {port}")
+    logger.info(f"Starting Filter API v7.0.2-ENHANCED-DIMENSIONS on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
