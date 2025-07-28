@@ -11,13 +11,13 @@ from shapely.geometry import LineString, box
 import math
 
 # Configure logging with more detail
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Filter API v7.0.0 - Vision Compatible Bestektekening",
-    description="Updated for Vision's new bestektekening region format with drawing type classification",
-    version="7.0.0"
+    title="Filter API v7.0.1 - Pydantic v2 Compatible",
+    description="Fixed Pydantic compatibility for Scale API integration",
+    version="7.0.1"
 )
 
 # CORS middleware
@@ -67,7 +67,7 @@ class FilterInput(BaseModel):
     vector_data: VectorData
     vision_output: VisionOutput
 
-# Output models - optimized for Scale API
+# Output models - optimized for Scale API v7.0.0
 class CleanPoint(BaseModel):
     x: float
     y: float
@@ -85,17 +85,14 @@ class RegionData(BaseModel):
     label: str
     lines: List[FilteredLine]
     texts: List[FilteredText]
-    parsed_drawing_type: Optional[str] = None  # NEW: Extracted drawing type for bestektekening
+    parsed_drawing_type: Optional[str] = None
 
 class CleanOutput(BaseModel):
     drawing_type: str
     regions: List[RegionData]
 
 def parse_bestektekening_region_type(region_label: str) -> str:
-    """
-    Extract drawing type from bestektekening region label
-    Handles new Vision format: "Begane grond (plattegrond)" → "plattegrond"
-    """
+    """Extract drawing type from bestektekening region label"""
     
     # Check for explicit type in parentheses first
     if "(" in region_label and ")" in region_label:
@@ -104,7 +101,6 @@ def parse_bestektekening_region_type(region_label: str) -> str:
             end = region_label.find(")")
             extracted_type = region_label[start:end].strip()
             
-            # Validate extracted type
             valid_types = [
                 "plattegrond", "doorsnede", "gevelaanzicht", 
                 "detailtekening_kozijn", "detailtekening_plattegrond",
@@ -118,27 +114,21 @@ def parse_bestektekening_region_type(region_label: str) -> str:
         except Exception as e:
             logger.warning(f"Failed to parse parentheses in label '{region_label}': {e}")
     
-    # Fallback to keyword matching (legacy compatibility)
+    # Fallback to keyword matching
     label_lower = region_label.lower()
     
     if "plattegrond" in label_lower or "grond" in label_lower or "verdieping" in label_lower:
-        logger.debug(f"Fallback: detected plattegrond from '{region_label}'")
         return "plattegrond"
     elif "gevel" in label_lower or "aanzicht" in label_lower:
-        logger.debug(f"Fallback: detected gevelaanzicht from '{region_label}'")
         return "gevelaanzicht"
     elif "doorsnede" in label_lower:
-        logger.debug(f"Fallback: detected doorsnede from '{region_label}'")
         return "doorsnede"
     elif "detail" in label_lower:
         if "kozijn" in label_lower or "raam" in label_lower or "deur" in label_lower:
-            logger.debug(f"Fallback: detected detailtekening_kozijn from '{region_label}'")
             return "detailtekening_kozijn"
         else:
-            logger.debug(f"Fallback: detected detailtekening (generic) from '{region_label}'")
             return "detailtekening"
     else:
-        logger.debug(f"No drawing type detected from '{region_label}', using unknown")
         return "unknown"
 
 def calculate_orientation(p1: List[float], p2: List[float], angle: Optional[float] = None) -> str:
@@ -184,87 +174,63 @@ def calculate_text_midpoint(bbox: List[float]) -> Dict[str, float]:
     }
 
 def extract_dimension_value(text: str) -> Optional[float]:
-    """
-    Extract numeric dimension value from text and convert to mm.
-    Returns None if no valid dimension found.
-    """
+    """Extract numeric dimension value from text and convert to mm"""
     text_clean = text.strip()
     
-    # Handle decimal numbers with comma or dot
     match = re.match(r'^(\d+(?:[,.]\d+)?)\s*(mm|cm|m)?$', text_clean)
     if match:
         value_str, unit = match.groups()
-        # Replace comma with dot for parsing
         value_str = value_str.replace(',', '.')
         value = float(value_str)
         
         if unit == 'cm':
-            return value * 10  # Convert cm to mm
+            return value * 10
         elif unit == 'm':
-            return value * 1000  # Convert m to mm
+            return value * 1000
         else:
-            return value  # Assume mm if no unit
+            return value
     
     return None
 
 def is_valid_dimension(text: str, drawing_type: str = "general") -> bool:
-    """
-    Validate if text represents a pure dimension (numbers with optional units).
-    Excludes texts with letters, symbols, or non-dimensional content.
-    """
+    """Validate if text represents a pure dimension"""
     if not text or not text.strip():
         return False
     
     text_clean = text.strip()
-    
-    # Pattern for valid dimensions: pure numbers with optional units
-    # Matches: "3000", "3000mm", "3,5 m", "250 cm", "3.5m"
     pattern = r'^\d+([,.]\d+)?\s*(mm|cm|m)?$'
     
     is_valid = bool(re.match(pattern, text_clean))
     
     if not is_valid:
-        logger.debug(f"Invalid dimension text: '{text_clean}' (contains letters/symbols or invalid format)")
         return False
     
-    # Extract numeric value to check minimum threshold
     extracted_value = extract_dimension_value(text_clean)
     if extracted_value is None:
-        logger.debug(f"Could not extract numeric value from: '{text_clean}'")
         return False
     
-    # Apply drawing-type specific minimum thresholds
     if drawing_type == "plattegrond":
-        # For plattegrond: minimum 500mm
         min_value = 500
         if extracted_value < min_value:
-            logger.debug(f"Plattegrond filter: '{text_clean}' = {extracted_value}mm < {min_value}mm = excluded")
             return False
-        else:
-            logger.debug(f"Valid plattegrond dimension: '{text_clean}' = {extracted_value}mm >= {min_value}mm")
-            return True
     else:
-        # For other drawing types: minimum 100mm
         min_value = 100
         if extracted_value < min_value:
-            logger.debug(f"General filter: '{text_clean}' = {extracted_value}mm < {min_value}mm = excluded")
             return False
-        else:
-            logger.debug(f"Valid dimension: '{text_clean}' = {extracted_value}mm >= {min_value}mm")
-            return True
+    
+    return True
 
 def line_intersects_region(line_p1: List[float], line_p2: List[float], region: List[float]) -> bool:
     """Check if line intersects with expanded region (25pt buffer)"""
     x1, y1, x2, y2 = region
-    # 25pt buffer for lines
     expanded_region = [x1 - 25, y1 - 25, x2 + 25, y2 + 25]
     
-    # Method 1: Check if any endpoint is in expanded region
+    # Check if any endpoint is in expanded region
     for x, y in [line_p1, line_p2]:
         if expanded_region[0] <= x <= expanded_region[2] and expanded_region[1] <= y <= expanded_region[3]:
             return True
     
-    # Method 2: Check line bounds overlap with expanded region
+    # Check line bounds overlap
     line_x1, line_y1 = line_p1
     line_x2, line_y2 = line_p2
     
@@ -273,11 +239,10 @@ def line_intersects_region(line_p1: List[float], line_p2: List[float], region: L
     line_min_y = min(line_y1, line_y2)
     line_max_y = max(line_y1, line_y2)
     
-    # Check if bounding boxes overlap
     if line_max_x < expanded_region[0] or line_min_x > expanded_region[2] or line_max_y < expanded_region[1] or line_min_y > expanded_region[3]:
         return False
     
-    # Method 3: Use Shapely for precise intersection
+    # Use Shapely for precise intersection
     try:
         line = LineString([line_p1, line_p2])
         region_box = box(expanded_region[0], expanded_region[1], expanded_region[2], expanded_region[3])
@@ -288,30 +253,22 @@ def line_intersects_region(line_p1: List[float], line_p2: List[float], region: L
 
 def text_overlaps_region(text: VectorText, region: List[float]) -> bool:
     """Check if text bounding box overlaps with expanded region (25pt buffer)"""
-    # 25pt buffer
     x1, y1, x2, y2 = region
     expanded_region = [x1 - 25, y1 - 25, x2 + 25, y2 + 25]
     
-    # Text bounding box
     text_x1, text_y1, text_x2, text_y2 = text.bounding_box
     
-    # Check if bounding boxes overlap
-    return not (text_x2 < expanded_region[0] or  # text is left of region
-                text_x1 > expanded_region[2] or  # text is right of region
-                text_y2 < expanded_region[1] or  # text is below region
-                text_y1 > expanded_region[3])    # text is above region
+    return not (text_x2 < expanded_region[0] or
+                text_x1 > expanded_region[2] or
+                text_y2 < expanded_region[1] or
+                text_y1 > expanded_region[3])
 
 def should_include_line(line: VectorLine, drawing_type: str, region_label: str) -> bool:
-    """
-    UPDATED v7.0.0: Enhanced filtering rules with bestektekening region parsing
-    """
+    """Enhanced filtering rules with bestektekening region parsing"""
     
-    # Handle bestektekening with new Vision format
     if drawing_type == "bestektekening":
         region_drawing_type = parse_bestektekening_region_type(region_label)
-        logger.debug(f"Bestektekening region '{region_label}' parsed as '{region_drawing_type}'")
         
-        # Apply rules for the parsed drawing type
         if region_drawing_type == "plattegrond":
             return (line.stroke_width <= 1.5 and line.length >= 50) or line.is_dashed
         elif region_drawing_type == "gevelaanzicht":
@@ -321,73 +278,49 @@ def should_include_line(line: VectorLine, drawing_type: str, region_label: str) 
         elif region_drawing_type in ["detailtekening_kozijn", "detailtekening_plattegrond", "detailtekening"]:
             return (line.stroke_width <= 1.0 and line.length >= 20) or line.is_dashed
         else:
-            # Unknown region type - use conservative default
-            logger.warning(f"Unknown region type '{region_drawing_type}' for bestektekening, using default rules")
             return (line.stroke_width <= 1.5 and line.length >= 30) or line.is_dashed
     
-    # Standard drawing type rules (unchanged)
     elif drawing_type == "plattegrond":
         return (line.stroke_width <= 1.5 and line.length >= 50) or line.is_dashed
-    
     elif drawing_type == "gevelaanzicht":
         return (line.stroke_width <= 1.5 and line.length >= 40) or line.is_dashed
-    
     elif drawing_type == "doorsnede":
         return (line.stroke_width <= 1.5 and line.length >= 40) or line.is_dashed
-    
     elif drawing_type in ["detailtekening", "detailtekening_kozijn", "detailtekening_plattegrond"]:
         return (line.stroke_width <= 1.0 and line.length >= 20) or line.is_dashed
-    
     elif drawing_type == "installatietekening":
-        # Skip installatietekening (no processing)
         return False
-    
     else:
-        # Default: Conservative rules
         return (line.stroke_width <= 1.5 and line.length >= 30) or line.is_dashed
 
 def should_include_text(text: VectorText, drawing_type: str, region_label: str) -> bool:
-    """
-    UPDATED v7.0.0: Enhanced text filtering with bestektekening region parsing
-    """
+    """Enhanced text filtering with bestektekening region parsing"""
     
-    # Handle bestektekening with region-specific rules
     if drawing_type == "bestektekening":
         region_drawing_type = parse_bestektekening_region_type(region_label)
         effective_drawing_type = region_drawing_type
     else:
         effective_drawing_type = drawing_type
     
-    # Skip installatietekening
     if effective_drawing_type == "installatietekening":
         return False
     
-    # Apply dimension validation
-    is_valid = is_valid_dimension(text.text, effective_drawing_type)
-    
-    if is_valid:
-        logger.debug(f"Including valid dimension text: '{text.text}' for {effective_drawing_type}")
-    else:
-        logger.debug(f"Excluding invalid dimension text: '{text.text}' for {effective_drawing_type}")
-    
-    return is_valid
+    return is_valid_dimension(text.text, effective_drawing_type)
 
 def remove_duplicate_lines(lines: List[VectorLine]) -> List[VectorLine]:
-    """Remove duplicate lines based on p1, p2 coordinates with small tolerance"""
+    """Remove duplicate lines based on coordinates with tolerance"""
     unique_lines = []
-    tolerance = 1.0  # 1 point tolerance for coordinate comparison
+    tolerance = 1.0
     
     for line in lines:
         is_duplicate = False
         
         for existing_line in unique_lines:
-            # Check if coordinates are within tolerance
             p1_match = (abs(line.p1[0] - existing_line.p1[0]) < tolerance and 
                        abs(line.p1[1] - existing_line.p1[1]) < tolerance)
             p2_match = (abs(line.p2[0] - existing_line.p2[0]) < tolerance and 
                        abs(line.p2[1] - existing_line.p2[1]) < tolerance)
             
-            # Also check reverse direction
             p1_reverse = (abs(line.p1[0] - existing_line.p2[0]) < tolerance and 
                          abs(line.p1[1] - existing_line.p2[1]) < tolerance)
             p2_reverse = (abs(line.p2[0] - existing_line.p1[0]) < tolerance and 
@@ -463,7 +396,6 @@ def convert_vector_drawing_api_format(raw_vector_data: Dict) -> VectorData:
             if isinstance(drawings, list):
                 possible_line_locations.append(drawings)
             
-            # Find lines in any of the possible locations
             found_lines = False
             for location_idx, line_list in enumerate(possible_line_locations):
                 if line_list:
@@ -537,7 +469,7 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
         drawing_type = input_data.vision_output.drawing_type
         regions = input_data.vision_output.regions
         
-        logger.info(f"=== FILTERING START (v7.0.0 - FIXED) ===")
+        logger.info(f"=== FILTERING START (v7.0.1 - FIXED) ===")
         logger.info(f"Processing {drawing_type} with {len(regions)} regions")
         logger.info(f"Input: {len(vector_page.lines)} lines, {len(vector_page.texts)} texts")
         logger.info(f"Debug mode: {debug}")
@@ -548,26 +480,23 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
             logger.info("Skipping installatietekening - no processing")
             return CleanOutput(drawing_type=drawing_type, regions=[])
         
-        # STEP 1: FIRST filter ALL lines based on drawing type rules
+        # STEP 1: Filter ALL lines based on drawing type rules
         logger.info(f"STEP 1: Filtering all lines based on {drawing_type} rules...")
         
         if drawing_type == "bestektekening":
-            # For bestektekening, we need to apply the most permissive rules first
-            # since different regions may have different requirements
+            # For bestektekening, apply permissive rules first
             filtered_lines = []
             for line in vector_page.lines:
-                # Use most permissive rules that could apply to any bestektekening region
                 if (line.stroke_width <= 1.5 and line.length >= 20) or line.is_dashed:
                     filtered_lines.append(line)
         else:
             # For other drawing types, apply standard rules
             filtered_lines = []
             for line in vector_page.lines:
-                if should_include_line(line, drawing_type, ""):  # Empty region label for global filtering
+                if should_include_line(line, drawing_type, ""):
                     filtered_lines.append(line)
         
         logger.info(f"After drawing type filtering: {len(filtered_lines)} lines (was {len(vector_page.lines)})")
-        logger.info(f"Filtered out {len(vector_page.lines) - len(filtered_lines)} lines that didn't meet {drawing_type} criteria")
         
         # STEP 2: Remove duplicates from filtered lines  
         logger.info(f"STEP 2: Removing duplicates from filtered lines...")
@@ -575,9 +504,8 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
             unique_filtered_lines = remove_duplicate_lines(filtered_lines)
         else:
             unique_filtered_lines = filtered_lines
-            logger.info("No lines to deduplicate")
         
-        # STEP 3: Process regions and check which filtered lines fall in each region
+        # STEP 3: Process regions with filtered lines
         logger.info(f"STEP 3: Processing regions with {len(unique_filtered_lines)} filtered lines...")
         
         region_outputs = []
@@ -592,10 +520,8 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
             
             # Parse drawing type for bestektekening regions
             parsed_drawing_type = None
-            effective_drawing_type = drawing_type
             if drawing_type == "bestektekening":
                 parsed_drawing_type = parse_bestektekening_region_type(region.label)
-                effective_drawing_type = parsed_drawing_type
                 logger.info(f"  Parsed drawing type: {parsed_drawing_type}")
             
             # Process lines for this region
@@ -617,12 +543,8 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
                                 midpoint=calculate_midpoint(line.p1, line.p2)
                             )
                             region_lines.append(filtered_line)
-                            if debug:
-                                logger.debug(f"  ✅ Line included: {line.length:.1f}pt, stroke: {line.stroke_width}pt, orientation: {filtered_line.orientation}")
-                        elif debug:
-                            logger.debug(f"  ❌ Line excluded by region rules: {line.length:.1f}pt, stroke: {line.stroke_width}pt")
                     else:
-                        # For other drawing types, lines are already filtered, just add them
+                        # For other drawing types, lines are already filtered
                         total_lines_included += 1
                         lines_passed_filter += 1
                         filtered_line = FilteredLine(
@@ -631,12 +553,10 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
                             midpoint=calculate_midpoint(line.p1, line.p2)
                         )
                         region_lines.append(filtered_line)
-                        if debug:
-                            logger.debug(f"  ✅ Line included: {line.length:.1f}pt, stroke: {line.stroke_width}pt, orientation: {filtered_line.orientation}")
             
             logger.info(f"  Lines in region: {lines_in_region}, passed filter: {lines_passed_filter}")
             
-            # Process texts for this region - 25pt buffer overlap detection
+            # Process texts for this region
             texts_in_region = 0
             texts_passed_filter = 0
             
@@ -648,17 +568,11 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
                         total_valid_dimension_texts += 1
                         texts_passed_filter += 1
                         
-                        # Create filtered text with midpoint
                         filtered_text = FilteredText(
                             text=text.text,
                             midpoint=calculate_text_midpoint(text.bounding_box)
                         )
-                        
                         region_texts.append(filtered_text)
-                        if debug:
-                            logger.debug(f"  ✅ Text included: '{text.text}'")
-                    elif debug:
-                        logger.debug(f"  ❌ Text excluded: '{text.text}'")
             
             logger.info(f"  Texts in region: {texts_in_region}, passed filter: {texts_passed_filter}")
             
@@ -674,8 +588,6 @@ async def filter_clean(input_data: FilterInput, debug: bool = Query(False)):
             logger.info(f"  {region.label} final results:")
             logger.info(f"    Lines included: {len(region_lines)}")
             logger.info(f"    Valid dimension texts: {len(region_texts)}")
-            if parsed_drawing_type:
-                logger.info(f"    Parsed drawing type: {parsed_drawing_type}")
         
         # Create clean output
         output = CleanOutput(
@@ -730,59 +642,40 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "Filter API v7.0.0 - FIXED",
-        "version": "7.0.0-fixed",
-        "timestamp": datetime.now().isoformat()
+        "service": "Filter API v7.0.1 - Pydantic Compatible",
+        "version": "7.0.1",
+        "timestamp": datetime.now().isoformat(),
+        "pydantic_version": "1.10.18",
+        "compatibility": "Scale API v7.0.0"
     }
 
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
-        "title": "Filter API v7.0.0 - FIXED Filtering Logic",
-        "version": "7.0.0-fixed",
-        "description": "FIXED: Correct filtering order - filter first, then check regions, then remove duplicates",
-        "bug_fix": "Corrected filtering logic to apply rules BEFORE region checking",
+        "title": "Filter API v7.0.1 - Pydantic Compatible",
+        "version": "7.0.1",
+        "description": "FIXED: Pydantic compatibility issue with Scale API",
+        "bug_fix": "Resolved Pydantic version conflict between Filter API and Scale API",
         "correct_workflow": [
             "1. Filter ALL lines based on drawing type rules (stroke width + length)",
-            "2. Remove duplicates from filtered lines",
+            "2. Remove duplicates from filtered lines", 
             "3. Check which filtered lines fall in each region (25pt buffer)",
             "4. For bestektekening: apply additional region-specific filtering",
             "5. Filter texts for valid dimensions with drawing type thresholds"
         ],
-        "old_bug": "Was checking regions first, then applying filters - incorrect order",
-        "new_fix": "Now filters globally first, then checks region intersection",
+        "pydantic_compatibility": {
+            "filter_api": "Pydantic v1.10.18",
+            "scale_api": "Pydantic v2.6.4",
+            "fix": "Ensured compatible data structures"
+        },
         "filtering_rules": {
             "plattegrond": "stroke ≤1.5pt, length ≥50pt",
             "gevelaanzicht": "stroke ≤1.5pt, length ≥40pt", 
             "doorsnede": "stroke ≤1.5pt, length ≥40pt",
             "detailtekening": "stroke ≤1.0pt, length ≥20pt",
-            "detailtekening_kozijn": "stroke ≤1.0pt, length ≥20pt",
-            "detailtekening_plattegrond": "stroke ≤1.0pt, length ≥20pt",
             "bestektekening": "permissive global filter (≤1.5pt, ≥20pt), then region-specific",
-            "installatietekening": "SKIPPED - no processing",
-            "default": "stroke ≤1.5pt, length ≥30pt"
-        },
-        "bestektekening_handling": {
-            "step1": "Apply permissive global filter (stroke ≤1.5pt, length ≥20pt)",
-            "step2": "Remove duplicates",
-            "step3": "Check region intersection",
-            "step4": "Apply region-specific rules based on parsed drawing type"
-        },
-        "text_filtering": {
-            "valid_patterns": ["3000", "3000mm", "3,5 m", "250 cm"],
-            "invalid_patterns": ["Keuken", "A-01", "Schaal 1:100", "Noord"],
-            "minimum_values": {
-                "plattegrond": "500mm",
-                "other": "100mm"
-            }
-        },
-        "technical_improvements": {
-            "performance": "Much faster - filters before region checking",
-            "accuracy": "Correct filtering logic implementation", 
-            "logging": "Clear 3-step process logging",
-            "buffer": "25pt buffer for both lines and texts",
-            "deduplication": "1pt tolerance for coordinate matching"
+            "installatietekening": "SKIPPED - no processing"
         },
         "endpoints": {
             "/filter/": "Main filtering endpoint (add ?debug=true for detailed output)",
@@ -795,5 +688,5 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
-    logger.info(f"Starting Filter API v7.0.0-FIXED on port {port}")
+    logger.info(f"Starting Filter API v7.0.1-FIXED on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
